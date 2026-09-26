@@ -92,6 +92,7 @@ class Tensor:
         if not isinstance(other, Tensor):
             other = Tensor(other)
 
+        # 1. Scalar + Scalar
         if self.shape == () and other.shape == ():
             result_val = self.data + other.data
             out = Tensor(result_val, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
@@ -109,7 +110,9 @@ class Tensor:
 
             out._backward = _backward
             return out
-        else:
+
+        # 2. 1D Vector + 1D Vector
+        elif len(self.shape) == 1 and len(other.shape) == 1:
             new_data = []
             len_self = len(self.data)
             for idx in range(len_self):
@@ -135,6 +138,79 @@ class Tensor:
 
             out._backward = _backward
             return out
+
+        # 3. 2D Matrix + 1D Bias (Broadcasting bias along rows)
+        elif len(self.shape) == 2 and len(other.shape) == 1:
+            rows = self.shape[0]
+            cols = self.shape[1]
+            if cols != other.shape[0]:
+                raise ValueError("Cannot broadcast bias of shape " + str(other.shape) + " to matrix with cols " + str(cols))
+
+            new_grid = []
+            for r in range(rows):
+                new_row = []
+                for c in range(cols):
+                    sum_val = self.data[r][c] + other.data[c]
+                    new_row.append(sum_val)
+                new_grid.append(new_row)
+
+            out = Tensor(new_grid, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            self.grad[r][c] = self.grad[r][c] + out.grad[r][c]
+
+                if other.requires_grad:
+                    if other.grad is None:
+                        other.grad = [0.0] * cols
+                    for c in range(cols):
+                        bias_grad_sum = 0.0
+                        for r in range(rows):
+                            bias_grad_sum = bias_grad_sum + out.grad[r][c]
+                        other.grad[c] = other.grad[c] + bias_grad_sum
+
+            out._backward = _backward
+            return out
+
+        # 4. 2D Matrix + 2D Matrix
+        elif len(self.shape) == 2 and len(other.shape) == 2:
+            if self.shape != other.shape:
+                raise ValueError("Shape mismatch for 2D addition: " + str(self.shape) + " vs " + str(other.shape))
+            rows = self.shape[0]
+            cols = self.shape[1]
+            new_grid = []
+            for r in range(rows):
+                new_row = []
+                for c in range(cols):
+                    new_row.append(self.data[r][c] + other.data[r][c])
+                new_grid.append(new_row)
+
+            out = Tensor(new_grid, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            self.grad[r][c] = self.grad[r][c] + out.grad[r][c]
+
+                if other.requires_grad:
+                    if other.grad is None:
+                        other.grad = _zeros_like_shape(other.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            other.grad[r][c] = other.grad[r][c] + out.grad[r][c]
+
+            out._backward = _backward
+            return out
+
+        else:
+            raise NotImplementedError("Addition not supported for shapes: " + str(self.shape) + " and " + str(other.shape))
 
     def __mul__(self, other):
         if not isinstance(other, Tensor):
