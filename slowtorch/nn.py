@@ -1,4 +1,3 @@
-
 import math
 import random
 from slowtorch.tensor import Tensor
@@ -6,7 +5,6 @@ from slowtorch.tensor import Tensor
 
 class Parameter(Tensor):
     def __init__(self, data):
-        # Parameters always track gradients
         super().__init__(data, requires_grad=True)
 
 
@@ -65,7 +63,6 @@ class Linear(Module):
         self.out_features = out_features
         self.use_bias = bias
 
-        # Uniform initialization bound: 1 / sqrt(in_features)
         bound = 1.0 / math.sqrt(in_features)
 
         weight_data = []
@@ -107,3 +104,13 @@ class Sigmoid(Module):
 
     def forward(self, x):
         return x.sigmoid()
+
+
+class MSELoss(Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, target):
+        diff = pred - target
+        squared = diff ** 2
+        return squared.mean()
