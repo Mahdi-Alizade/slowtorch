@@ -1,4 +1,3 @@
-# D:\Mahdi Alizade\Projects\slowtorch\slowtorch\nn.py
 
 import math
 import random
@@ -30,11 +29,9 @@ class Module:
 
     def parameters(self):
         params = []
-        # Collect parameters belonging directly to this module
         for p in self._parameters:
             params.append(p)
 
-        # Collect parameters recursively from child modules
         for sub in self._submodules:
             for sub_p in sub.parameters():
                 params.append(sub_p)
@@ -68,10 +65,9 @@ class Linear(Module):
         self.out_features = out_features
         self.use_bias = bias
 
-        # Kaiming / PyTorch default uniform initialization bound: 1 / sqrt(in_features)
+        # Uniform initialization bound: 1 / sqrt(in_features)
         bound = 1.0 / math.sqrt(in_features)
 
-        # Initialize weights: shape (in_features, out_features)
         weight_data = []
         for _ in range(in_features):
             row = []
@@ -82,7 +78,6 @@ class Linear(Module):
 
         self.weight = Parameter(weight_data)
 
-        # Initialize bias: shape (out_features,) with zeros
         if self.use_bias:
             bias_data = []
             for _ in range(out_features):
@@ -92,8 +87,23 @@ class Linear(Module):
             self.bias = None
 
     def forward(self, x):
-        # Output = x @ weight + bias
         out = x @ self.weight
         if self.bias is not None:
             out = out + self.bias
         return out
+
+
+class ReLU(Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x.relu()
+
+
+class Sigmoid(Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x.sigmoid()
