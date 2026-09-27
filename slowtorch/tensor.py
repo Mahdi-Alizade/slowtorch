@@ -1,4 +1,3 @@
-
 import math
 
 
@@ -93,7 +92,6 @@ class Tensor:
         if not isinstance(other, Tensor):
             other = Tensor(other)
 
-        # 1. Scalar + Scalar
         if self.shape == () and other.shape == ():
             result_val = self.data + other.data
             out = Tensor(result_val, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
@@ -112,7 +110,6 @@ class Tensor:
             out._backward = _backward
             return out
 
-        # 2. 1D Vector + 1D Vector
         elif len(self.shape) == 1 and len(other.shape) == 1:
             new_data = []
             len_self = len(self.data)
@@ -140,7 +137,6 @@ class Tensor:
             out._backward = _backward
             return out
 
-        # 3. 2D Matrix + 1D Bias (Broadcasting bias along rows)
         elif len(self.shape) == 2 and len(other.shape) == 1:
             rows = self.shape[0]
             cols = self.shape[1]
@@ -177,7 +173,6 @@ class Tensor:
             out._backward = _backward
             return out
 
-        # 4. 2D Matrix + 2D Matrix
         elif len(self.shape) == 2 and len(other.shape) == 2:
             if self.shape != other.shape:
                 raise ValueError("Shape mismatch for 2D addition: " + str(self.shape) + " vs " + str(other.shape))
@@ -213,10 +208,19 @@ class Tensor:
         else:
             raise NotImplementedError("Addition not supported for shapes: " + str(self.shape) + " and " + str(other.shape))
 
+    def __neg__(self):
+        return self * -1.0
+
+    def __sub__(self, other):
+        if not isinstance(other, Tensor):
+            other = Tensor(other)
+        return self + (-other)
+
     def __mul__(self, other):
         if not isinstance(other, Tensor):
             other = Tensor(other)
 
+        # Scalar * Scalar
         if self.shape == () and other.shape == ():
             result_val = self.data * other.data
             out = Tensor(result_val, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="*")
@@ -234,7 +238,40 @@ class Tensor:
 
             out._backward = _backward
             return out
-        else:
+
+        # 2D Matrix * Scalar
+        elif len(self.shape) == 2 and other.shape == ():
+            new_data = []
+            rows = self.shape[0]
+            cols = self.shape[1]
+            for r in range(rows):
+                row = []
+                for c in range(cols):
+                    row.append(self.data[r][c] * other.data)
+                new_data.append(row)
+
+            out = Tensor(new_data, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="*")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            self.grad[r][c] = self.grad[r][c] + other.data * out.grad[r][c]
+
+                if other.requires_grad:
+                    if other.grad is None:
+                        other.grad = 0.0
+                    for r in range(rows):
+                        for c in range(cols):
+                            other.grad = other.grad + self.data[r][c] * out.grad[r][c]
+
+            out._backward = _backward
+            return out
+
+        # 1D Vector * 1D Vector (Element-wise)
+        elif len(self.shape) == 1 and len(other.shape) == 1:
             new_data = []
             for i in range(len(self.data)):
                 mult_val = self.data[i] * other.data[i]
@@ -257,6 +294,107 @@ class Tensor:
 
             out._backward = _backward
             return out
+
+        # 2D Matrix * 2D Matrix (Element-wise)
+        elif len(self.shape) == 2 and len(other.shape) == 2:
+            if self.shape != other.shape:
+                raise ValueError("Shape mismatch for element-wise multiplication: " + str(self.shape) + " vs " + str(other.shape))
+            rows = self.shape[0]
+            cols = self.shape[1]
+            new_grid = []
+            for r in range(rows):
+                new_row = []
+                for c in range(cols):
+                    new_row.append(self.data[r][c] * other.data[r][c])
+                new_grid.append(new_row)
+
+            out = Tensor(new_grid, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="*")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            self.grad[r][c] = self.grad[r][c] + other.data[r][c] * out.grad[r][c]
+
+                if other.requires_grad:
+                    if other.grad is None:
+                        other.grad = _zeros_like_shape(other.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            other.grad[r][c] = other.grad[r][c] + self.data[r][c] * out.grad[r][c]
+
+            out._backward = _backward
+            return out
+
+        else:
+            raise NotImplementedError("Multiplication not implemented for shapes: " + str(self.shape) + " and " + str(other.shape))
+
+    def __pow__(self, power):
+        if not isinstance(power, (int, float)):
+            raise TypeError("Power must be an int or float, got " + str(type(power)))
+
+        # Scalar
+        if self.shape == ():
+            val = self.data ** power
+            out = Tensor(val, requires_grad=self.requires_grad, _parents=(self,), _op="**" + str(power))
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = 0.0
+                    local_grad = power * (self.data ** (power - 1))
+                    self.grad = self.grad + local_grad * out.grad
+
+            out._backward = _backward
+            return out
+
+        # 1D Vector
+        elif len(self.shape) == 1:
+            out_data = []
+            for item in self.data:
+                out_data.append(item ** power)
+
+            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="**" + str(power))
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = [0.0] * len(self.data)
+                    for i in range(len(self.data)):
+                        local_grad = power * (self.data[i] ** (power - 1))
+                        self.grad[i] = self.grad[i] + local_grad * out.grad[i]
+
+            out._backward = _backward
+            return out
+
+        # 2D Matrix
+        elif len(self.shape) == 2:
+            rows = self.shape[0]
+            cols = self.shape[1]
+            out_data = []
+            for r in range(rows):
+                row_items = []
+                for c in range(cols):
+                    row_items.append(self.data[r][c] ** power)
+                out_data.append(row_items)
+
+            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="**" + str(power))
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            local_grad = power * (self.data[r][c] ** (power - 1))
+                            self.grad[r][c] = self.grad[r][c] + local_grad * out.grad[r][c]
+
+            out._backward = _backward
+            return out
+        else:
+            raise NotImplementedError("Power not implemented for shape: " + str(self.shape))
 
     def matmul(self, other):
         if not isinstance(other, Tensor):
@@ -299,7 +437,6 @@ class Tensor:
         return self.matmul(other)
 
     def relu(self):
-        # Scalar ReLU
         if self.shape == ():
             val = self.data if self.data > 0.0 else 0.0
             out = Tensor(val, requires_grad=self.requires_grad, _parents=(self,), _op="relu")
@@ -314,7 +451,6 @@ class Tensor:
             out._backward = _backward
             return out
 
-        # 1D Vector ReLU
         elif len(self.shape) == 1:
             out_data = []
             for item in self.data:
@@ -336,7 +472,6 @@ class Tensor:
             out._backward = _backward
             return out
 
-        # 2D Matrix ReLU
         elif len(self.shape) == 2:
             out_data = []
             rows = self.shape[0]
@@ -369,14 +504,12 @@ class Tensor:
 
     def sigmoid(self):
         def _calc_sigmoid(x):
-            # Clip between -500 and 500 to avoid math overflow
             if x < -500.0:
                 return 0.0
             if x > 500.0:
                 return 1.0
             return 1.0 / (1.0 + math.exp(-x))
 
-        # Scalar Sigmoid
         if self.shape == ():
             sig_val = _calc_sigmoid(self.data)
             out = Tensor(sig_val, requires_grad=self.requires_grad, _parents=(self,), _op="sigmoid")
@@ -391,7 +524,6 @@ class Tensor:
             out._backward = _backward
             return out
 
-        # 1D Vector Sigmoid
         elif len(self.shape) == 1:
             out_data = []
             for item in self.data:
@@ -410,7 +542,6 @@ class Tensor:
             out._backward = _backward
             return out
 
-        # 2D Matrix Sigmoid
         elif len(self.shape) == 2:
             out_data = []
             rows = self.shape[0]
@@ -472,6 +603,17 @@ class Tensor:
 
         out._backward = _backward
         return out
+
+    def mean(self):
+        total_elements = 1
+        for dim in self.shape:
+            total_elements = total_elements * dim
+        if total_elements == 0:
+            total_elements = 1
+
+        summed = self.sum()
+        scale = 1.0 / float(total_elements)
+        return summed * scale
 
     def backward(self):
         topo = []
