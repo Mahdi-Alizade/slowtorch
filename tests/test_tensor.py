@@ -1,6 +1,5 @@
-# D:\Mahdi Alizade\Projects\slowtorch\tests\test_tensor.py
-
 import pytest
+import math
 from slowtorch.tensor import Tensor
 
 
@@ -33,9 +32,6 @@ def test_vector_addition_and_multiplication_backward():
 
 
 def test_matrix_multiplication_forward_and_backward():
-    # A is 2x3, B is 3x2
-    # C = A @ B (2x2)
-    # loss = sum(C)
     mat_a = [
         [1.0, 2.0, 3.0],
         [4.0, 5.0, 6.0]
@@ -52,31 +48,12 @@ def test_matrix_multiplication_forward_and_backward():
     c = a @ b
 
     assert c.shape == (2, 2)
-    # row0: [1*1 + 2*3 + 3*5 = 22, 1*2 + 2*4 + 3*6 = 28]
-    # row1: [4*1 + 5*3 + 6*5 = 49, 4*2 + 5*4 + 6*6 = 64]
     assert c.data == [[22.0, 28.0], [49.0, 64.0]]
 
     loss = c.sum()
     loss.backward()
 
-    # dloss/dc is all 1.0
-    # dloss/da = dloss/dc @ b.T
-    # b.T is:
-    # [1.0, 3.0, 5.0]
-    # [2.0, 4.0, 6.0]
-    # dloss/dc is [[1, 1], [1, 1]]
-    # row0 of grad_a = [1*1 + 1*2, 1*3 + 1*4, 1*5 + 1*6] = [3.0, 7.0, 11.0]
-    # row1 of grad_a = [3.0, 7.0, 11.0]
     assert a.grad == [[3.0, 7.0, 11.0], [3.0, 7.0, 11.0]]
-
-    # dloss/db = a.T @ dloss/dc
-    # a.T is:
-    # [1.0, 4.0]
-    # [2.0, 5.0]
-    # [3.0, 6.0]
-    # row0 of grad_b = [1*1 + 4*1, 1*1 + 4*1] = [5.0, 5.0]
-    # row1 of grad_b = [2*1 + 5*1, 2*1 + 5*1] = [7.0, 7.0]
-    # row2 of grad_b = [3*1 + 6*1, 3*1 + 6*1] = [9.0, 9.0]
     assert b.grad == [[5.0, 5.0], [7.0, 7.0], [9.0, 9.0]]
 
 
@@ -86,3 +63,28 @@ def test_matrix_multiplication_dimension_mismatch():
 
     with pytest.raises(ValueError):
         _ = a @ b
+
+
+def test_relu_forward_and_backward():
+    # 2D matrix with both positive and negative values
+    x = Tensor([[-2.0, 3.0], [0.0, -1.0]], requires_grad=True)
+    y = x.relu()
+
+    assert y.data == [[0.0, 3.0], [0.0, 0.0]]
+
+    loss = y.sum()
+    loss.backward()
+
+    # Gradient should be 1.0 for x > 0 and 0.0 for x <= 0
+    assert x.grad == [[0.0, 1.0], [0.0, 0.0]]
+
+
+def test_sigmoid_forward_and_backward():
+    # Test at 0.0 where sigmoid(0) = 0.5 and derivative is 0.5 * (1 - 0.5) = 0.25
+    x = Tensor(0.0, requires_grad=True)
+    y = x.sigmoid()
+
+    assert abs(y.data - 0.5) < 1e-6
+
+    y.backward()
+    assert abs(x.grad - 0.25) < 1e-6
