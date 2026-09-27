@@ -1,4 +1,5 @@
-# D:\Mahdi Alizade\Projects\slowtorch\slowtorch\tensor.py
+
+import math
 
 
 def _zeros_like_shape(shape):
@@ -296,6 +297,146 @@ class Tensor:
 
     def __matmul__(self, other):
         return self.matmul(other)
+
+    def relu(self):
+        # Scalar ReLU
+        if self.shape == ():
+            val = self.data if self.data > 0.0 else 0.0
+            out = Tensor(val, requires_grad=self.requires_grad, _parents=(self,), _op="relu")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = 0.0
+                    local_derivative = 1.0 if self.data > 0.0 else 0.0
+                    self.grad = self.grad + local_derivative * out.grad
+
+            out._backward = _backward
+            return out
+
+        # 1D Vector ReLU
+        elif len(self.shape) == 1:
+            out_data = []
+            for item in self.data:
+                if item > 0.0:
+                    out_data.append(item)
+                else:
+                    out_data.append(0.0)
+
+            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="relu")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = [0.0] * len(self.data)
+                    for i in range(len(self.data)):
+                        local_derivative = 1.0 if self.data[i] > 0.0 else 0.0
+                        self.grad[i] = self.grad[i] + local_derivative * out.grad[i]
+
+            out._backward = _backward
+            return out
+
+        # 2D Matrix ReLU
+        elif len(self.shape) == 2:
+            out_data = []
+            rows = self.shape[0]
+            cols = self.shape[1]
+            for r in range(rows):
+                row_items = []
+                for c in range(cols):
+                    elem = self.data[r][c]
+                    if elem > 0.0:
+                        row_items.append(elem)
+                    else:
+                        row_items.append(0.0)
+                out_data.append(row_items)
+
+            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="relu")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            local_derivative = 1.0 if self.data[r][c] > 0.0 else 0.0
+                            self.grad[r][c] = self.grad[r][c] + local_derivative * out.grad[r][c]
+
+            out._backward = _backward
+            return out
+        else:
+            raise NotImplementedError("ReLU not implemented for shape: " + str(self.shape))
+
+    def sigmoid(self):
+        def _calc_sigmoid(x):
+            # Clip between -500 and 500 to avoid math overflow
+            if x < -500.0:
+                return 0.0
+            if x > 500.0:
+                return 1.0
+            return 1.0 / (1.0 + math.exp(-x))
+
+        # Scalar Sigmoid
+        if self.shape == ():
+            sig_val = _calc_sigmoid(self.data)
+            out = Tensor(sig_val, requires_grad=self.requires_grad, _parents=(self,), _op="sigmoid")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = 0.0
+                    local_derivative = out.data * (1.0 - out.data)
+                    self.grad = self.grad + local_derivative * out.grad
+
+            out._backward = _backward
+            return out
+
+        # 1D Vector Sigmoid
+        elif len(self.shape) == 1:
+            out_data = []
+            for item in self.data:
+                out_data.append(_calc_sigmoid(item))
+
+            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="sigmoid")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = [0.0] * len(self.data)
+                    for i in range(len(self.data)):
+                        local_derivative = out.data[i] * (1.0 - out.data[i])
+                        self.grad[i] = self.grad[i] + local_derivative * out.grad[i]
+
+            out._backward = _backward
+            return out
+
+        # 2D Matrix Sigmoid
+        elif len(self.shape) == 2:
+            out_data = []
+            rows = self.shape[0]
+            cols = self.shape[1]
+            for r in range(rows):
+                row_items = []
+                for c in range(cols):
+                    elem = self.data[r][c]
+                    row_items.append(_calc_sigmoid(elem))
+                out_data.append(row_items)
+
+            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="sigmoid")
+
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            local_derivative = out.data[r][c] * (1.0 - out.data[r][c])
+                            self.grad[r][c] = self.grad[r][c] + local_derivative * out.grad[r][c]
+
+            out._backward = _backward
+            return out
+        else:
+            raise NotImplementedError("Sigmoid not implemented for shape: " + str(self.shape))
 
     def sum(self):
         total = 0.0
