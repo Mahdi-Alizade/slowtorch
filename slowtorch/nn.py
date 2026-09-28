@@ -22,7 +22,6 @@ class Parameter(Tensor):
 
 class Module:
     def __init__(self):
-        # Using dicts with insertion order to track named parameters and submodules
         self._named_parameters = {}
         self._named_submodules = {}
 
@@ -87,7 +86,6 @@ class Module:
         for name, target_param in current_params.items():
             if name in state_dict:
                 incoming_data = state_dict[name]
-                # Replace data with deep copied incoming values
                 target_param.data = _deep_copy_nested_list(incoming_data)
 
     def save(self, filepath):
@@ -118,6 +116,30 @@ class Module:
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
+
+
+class Sequential(Module):
+    def __init__(self, *modules):
+        super().__init__()
+        self._layers = []
+        for idx, mod in enumerate(modules):
+            if not isinstance(mod, Module):
+                raise TypeError("Sequential arguments must be instances of Module, got " + str(type(mod)))
+            # Register submodule using its index string so named_parameters works
+            setattr(self, str(idx), mod)
+            self._layers.append(mod)
+
+    def __getitem__(self, idx):
+        return self._layers[idx]
+
+    def __len__(self):
+        return len(self._layers)
+
+    def forward(self, x):
+        out = x
+        for layer in self._layers:
+            out = layer(out)
+        return out
 
 
 class Linear(Module):
