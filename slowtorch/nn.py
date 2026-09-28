@@ -1,6 +1,18 @@
 import math
 import random
+import json
 from slowtorch.tensor import Tensor, _zeros_like_shape
+
+
+def _deep_copy_nested_list(data):
+    if isinstance(data, (int, float)):
+        return float(data)
+    if isinstance(data, list):
+        res = []
+        for item in data:
+            res.append(_deep_copy_nested_list(item))
+        return res
+    return data
 
 
 class Parameter(Tensor):
@@ -10,31 +22,83 @@ class Parameter(Tensor):
 
 class Module:
     def __init__(self):
-        self._submodules = []
-        self._parameters = []
+        # Using dicts with insertion order to track named parameters and submodules
+        self._named_parameters = {}
+        self._named_submodules = {}
 
     def __setattr__(self, name, value):
         if isinstance(value, Parameter):
-            if not hasattr(self, "_parameters"):
-                super().__setattr__("_parameters", [])
-            self._parameters.append(value)
+            if not hasattr(self, "_named_parameters"):
+                super().__setattr__("_named_parameters", {})
+            self._named_parameters[name] = value
         elif isinstance(value, Module):
-            if not hasattr(self, "_submodules"):
-                super().__setattr__("_submodules", [])
-            self._submodules.append(value)
+            if not hasattr(self, "_named_submodules"):
+                super().__setattr__("_named_submodules", {})
+            self._named_submodules[name] = value
 
         super().__setattr__(name, value)
 
     def parameters(self):
         params = []
-        for p in self._parameters:
+        for p in self._named_parameters.values():
             params.append(p)
 
-        for sub in self._submodules:
+        for sub in self._named_submodules.values():
             for sub_p in sub.parameters():
                 params.append(sub_p)
 
         return params
+
+    def named_parameters(self, prefix=""):
+        items = []
+        for name, param in self._named_parameters.items():
+            full_name = (prefix + "." + name) if prefix else name
+            items.append((full_name, param))
+
+        for sub_name, sub in self._named_submodules.items():
+            sub_prefix = (prefix + "." + sub_name) if prefix else sub_name
+            for full_name, param in sub.named_parameters(prefix=sub_prefix):
+                items.append((full_name, param))
+
+        return items
+
+    def state_dict(self):
+        state = {}
+        for name, param in self.named_parameters():
+            state[name] = _deep_copy_nested_list(param.data)
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        current_params = dict(self.named_parameters())
+        state_keys = set(state_dict.keys())
+        model_keys = set(current_params.keys())
+
+        if strict:
+            missing_keys = model_keys - state_keys
+            unexpected_keys = state_keys - model_keys
+            if len(missing_keys) > 0 or len(unexpected_keys) > 0:
+                err_msg = "Error loading state_dict."
+                if len(missing_keys) > 0:
+                    err_msg = err_msg + " Missing keys: " + str(list(missing_keys)) + "."
+                if len(unexpected_keys) > 0:
+                    err_msg = err_msg + " Unexpected keys: " + str(list(unexpected_keys)) + "."
+                raise KeyError(err_msg)
+
+        for name, target_param in current_params.items():
+            if name in state_dict:
+                incoming_data = state_dict[name]
+                # Replace data with deep copied incoming values
+                target_param.data = _deep_copy_nested_list(incoming_data)
+
+    def save(self, filepath):
+        state = self.state_dict()
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+    def load(self, filepath, strict=True):
+        with open(filepath, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        self.load_state_dict(state, strict=strict)
 
     def zero_grad(self):
         for p in self.parameters():
@@ -130,7 +194,6 @@ class Softmax(Module):
         probs = []
 
         for r in range(rows):
-            # Find max for numerical stability
             max_val = x.data[r][0]
             for c in range(1, cols):
                 if x.data[r][c] > max_val:
@@ -155,7 +218,6 @@ class Softmax(Module):
                 if x.grad is None:
                     x.grad = _zeros_like_shape(x.shape)
                 for r in range(rows):
-                    # Local Jacobian-vector product: p_i * (grad_i - sum(grad_j * p_j))
                     dot_grad_p = 0.0
                     for c in range(cols):
                         dot_grad_p = dot_grad_p + out.grad[r][c] * probs[r][c]
@@ -178,7 +240,6 @@ class CrossEntropyLoss(Module):
         rows = logits.shape[0]
         cols = logits.shape[1]
 
-        # Targets can be 1D list of class indices or 2D Tensor (batch_size, 1)
         if isinstance(targets, Tensor):
             if len(targets.shape) == 2:
                 target_indices = [int(targets.data[i][0]) for i in range(rows)]
@@ -193,7 +254,6 @@ class CrossEntropyLoss(Module):
         probabilities = []
 
         for r in range(rows):
-            # Numerically stable Log-Sum-Exp
             max_val = logits.data[r][0]
             for c in range(1, cols):
                 if logits.data[r][c] > max_val:
