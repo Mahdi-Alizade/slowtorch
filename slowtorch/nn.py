@@ -24,6 +24,7 @@ class Module:
     def __init__(self):
         self._named_parameters = {}
         self._named_submodules = {}
+        self.training = True
 
     def __setattr__(self, name, value):
         if isinstance(value, Parameter):
@@ -36,6 +37,15 @@ class Module:
             self._named_submodules[name] = value
 
         super().__setattr__(name, value)
+
+    def train(self, mode=True):
+        self.training = mode
+        for sub in self._named_submodules.values():
+            sub.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
 
     def parameters(self):
         params = []
@@ -125,7 +135,6 @@ class Sequential(Module):
         for idx, mod in enumerate(modules):
             if not isinstance(mod, Module):
                 raise TypeError("Sequential arguments must be instances of Module, got " + str(type(mod)))
-            # Register submodule using its index string so named_parameters works
             setattr(self, str(idx), mod)
             self._layers.append(mod)
 
@@ -174,6 +183,76 @@ class Linear(Module):
         if self.bias is not None:
             out = out + self.bias
         return out
+
+
+class Dropout(Module):
+    def __init__(self, p=0.5):
+        super().__init__()
+        if p < 0.0 or p >= 1.0:
+            raise ValueError("Dropout probability p must be in the range [0.0, 1.0), got " + str(p))
+        self.p = float(p)
+
+    def forward(self, x):
+        # In eval mode or p=0, identity pass-through
+        if not self.training or self.p == 0.0:
+            return x
+
+        scale = 1.0 / (1.0 - self.p)
+
+        # 1D Vector Dropout
+        if len(x.shape) == 1:
+            mask = []
+            out_data = []
+            for i in range(len(x.data)):
+                # Keep neuron with probability (1 - p)
+                keep = 1.0 if random.random() >= self.p else 0.0
+                mask.append(keep * scale)
+                out_data.append(x.data[i] * keep * scale)
+
+            out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,), _op="dropout")
+
+            def _backward():
+                if x.requires_grad:
+                    if x.grad is None:
+                        x.grad = [0.0] * len(x.data)
+                    for i in range(len(x.data)):
+                        x.grad[i] = x.grad[i] + out.grad[i] * mask[i]
+
+            out._backward = _backward
+            return out
+
+        # 2D Matrix Dropout
+        elif len(x.shape) == 2:
+            rows = x.shape[0]
+            cols = x.shape[1]
+            mask = []
+            out_data = []
+
+            for r in range(rows):
+                mask_row = []
+                data_row = []
+                for c in range(cols):
+                    keep = 1.0 if random.random() >= self.p else 0.0
+                    mask_row.append(keep * scale)
+                    data_row.append(x.data[r][c] * keep * scale)
+                mask.append(mask_row)
+                out_data.append(data_row)
+
+            out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,), _op="dropout")
+
+            def _backward():
+                if x.requires_grad:
+                    if x.grad is None:
+                        x.grad = _zeros_like_shape(x.shape)
+                    for r in range(rows):
+                        for c in range(cols):
+                            x.grad[r][c] = x.grad[r][c] + out.grad[r][c] * mask[r][c]
+
+            out._backward = _backward
+            return out
+
+        else:
+            raise NotImplementedError("Dropout currently only supports 1D and 2D tensors, got shape " + str(x.shape))
 
 
 class ReLU(Module):
