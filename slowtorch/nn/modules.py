@@ -193,18 +193,15 @@ class Dropout(Module):
         self.p = float(p)
 
     def forward(self, x):
-        # In eval mode or p=0, identity pass-through
         if not self.training or self.p == 0.0:
             return x
 
         scale = 1.0 / (1.0 - self.p)
 
-        # 1D Vector Dropout
         if len(x.shape) == 1:
             mask = []
             out_data = []
             for i in range(len(x.data)):
-                # Keep neuron with probability (1 - p)
                 keep = 1.0 if random.random() >= self.p else 0.0
                 mask.append(keep * scale)
                 out_data.append(x.data[i] * keep * scale)
@@ -221,7 +218,6 @@ class Dropout(Module):
             out._backward = _backward
             return out
 
-        # 2D Matrix Dropout
         elif len(x.shape) == 2:
             rows = x.shape[0]
             cols = x.shape[1]
@@ -250,7 +246,6 @@ class Dropout(Module):
 
             out._backward = _backward
             return out
-
         else:
             raise NotImplementedError("Dropout currently only supports 1D and 2D tensors, got shape " + str(x.shape))
 
