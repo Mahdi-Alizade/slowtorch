@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slowtorch"
+version = "0.1.0"
+description = "Implementation of PyTorch from the ground up in 100% pure Python"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Mahdi Alizade" }
+]
+keywords = ["deep-learning", "autograd", "neural-networks", "pure-python", "machine-learning"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["slowtorch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
