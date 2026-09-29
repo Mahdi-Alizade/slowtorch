@@ -185,6 +185,140 @@ class Linear(Module):
         return out
 
 
+class LayerNorm(Module):
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = float(eps)
+        self.elementwise_affine = elementwise_affine
+
+        if len(self.normalized_shape) != 1:
+            raise NotImplementedError("LayerNorm currently only supports 1D normalized_shape, got " + str(self.normalized_shape))
+
+        num_features = self.normalized_shape[0]
+
+        if self.elementwise_affine:
+            # gamma initialized to 1.0, beta to 0.0
+            gamma_data = [1.0] * num_features
+            beta_data = [0.0] * num_features
+            self.weight = Parameter(gamma_data)
+            self.bias = Parameter(beta_data)
+        else:
+            self.weight = None
+            self.bias = None
+
+    def forward(self, x):
+        if len(x.shape) != 2:
+            raise NotImplementedError("LayerNorm currently only supports 2D inputs (batch_size, features)")
+
+        rows = x.shape[0]
+        cols = x.shape[1]
+        dim = float(cols)
+
+        if cols != self.normalized_shape[0]:
+            raise ValueError("Input feature size (" + str(cols) + ") doesn't match LayerNorm shape (" + str(self.normalized_shape[0]) + ")")
+
+        normalized_grid = []
+        x_hat_grid = []
+        inv_std_list = []
+
+        for r in range(rows):
+            # 1. Compute Mean
+            mean_val = 0.0
+            for c in range(cols):
+                mean_val = mean_val + x.data[r][c]
+            mean_val = mean_val / dim
+
+            # 2. Compute Variance
+            var_val = 0.0
+            for c in range(cols):
+                diff = x.data[r][c] - mean_val
+                var_val = var_val + diff * diff
+            var_val = var_val / dim
+
+            inv_std = 1.0 / math.sqrt(var_val + self.eps)
+            inv_std_list.append(inv_std)
+
+            # 3. Standardize and scale/shift
+            out_row = []
+            x_hat_row = []
+            for c in range(cols):
+                x_hat = (x.data[r][c] - mean_val) * inv_std
+                x_hat_row.append(x_hat)
+
+                val = x_hat
+                if self.elementwise_affine:
+                    val = val * self.weight.data[c] + self.bias.data[c]
+                out_row.append(val)
+
+            x_hat_grid.append(x_hat_row)
+            normalized_grid.append(out_row)
+
+        parents = [x]
+        req_grad = x.requires_grad
+        if self.elementwise_affine:
+            parents.append(self.weight)
+            parents.append(self.bias)
+            req_grad = req_grad or self.weight.requires_grad or self.bias.requires_grad
+
+        out = Tensor(normalized_grid, requires_grad=req_grad, _parents=tuple(parents), _op="layernorm")
+
+        def _backward():
+            # Gradients with respect to gamma (weight) and beta (bias)
+            if self.elementwise_affine:
+                if self.weight.requires_grad:
+                    if self.weight.grad is None:
+                        self.weight.grad = [0.0] * cols
+                    for c in range(cols):
+                        g_sum = 0.0
+                        for r in range(rows):
+                            g_sum = g_sum + out.grad[r][c] * x_hat_grid[r][c]
+                        self.weight.grad[c] = self.weight.grad[c] + g_sum
+
+                if self.bias.requires_grad:
+                    if self.bias.grad is None:
+                        self.bias.grad = [0.0] * cols
+                    for c in range(cols):
+                        b_sum = 0.0
+                        for r in range(rows):
+                            b_sum = b_sum + out.grad[r][c]
+                        self.bias.grad[c] = self.bias.grad[c] + b_sum
+
+            # Gradients with respect to input x
+            if x.requires_grad:
+                if x.grad is None:
+                    x.grad = _zeros_like_shape(x.shape)
+
+                for r in range(rows):
+                    inv_std = inv_std_list[r]
+
+                    # Compute dL/d(x_hat)
+                    dl_dxhat = []
+                    for c in range(cols):
+                        if self.elementwise_affine:
+                            dl_dxhat.append(out.grad[r][c] * self.weight.data[c])
+                        else:
+                            dl_dxhat.append(out.grad[r][c])
+
+                    # Compute intermediate sums: sum(dL/dx_hat) and sum(dL/dx_hat * x_hat)
+                    sum_dl = 0.0
+                    sum_dl_xhat = 0.0
+                    for c in range(cols):
+                        sum_dl = sum_dl + dl_dxhat[c]
+                        sum_dl_xhat = sum_dl_xhat + dl_dxhat[c] * x_hat_grid[r][c]
+
+                    # Apply analytic gradient formula
+                    for c in range(cols):
+                        grad_term = dim * dl_dxhat[c] - sum_dl - x_hat_grid[r][c] * sum_dl_xhat
+                        dx = (inv_std / dim) * grad_term
+                        x.grad[r][c] = x.grad[r][c] + dx
+
+        out._backward = _backward
+        return out
+
+
 class Dropout(Module):
     def __init__(self, p=0.5):
         super().__init__()
