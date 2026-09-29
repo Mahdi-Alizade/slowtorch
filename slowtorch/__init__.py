@@ -13,6 +13,7 @@ from slowtorch.nn import (
     clip_grad_norm_,
 )
 from slowtorch.optim import SGD, Adam
+from slowtorch.data import Dataset, TensorDataset, DataLoader
 
 __all__ = [
     "Tensor",
@@ -32,4 +33,7 @@ __all__ = [
     "clip_grad_norm_",
     "SGD",
     "Adam",
+    "Dataset",
+    "TensorDataset",
+    "DataLoader",
 ]
