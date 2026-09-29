@@ -1,6 +1,17 @@
 import math
 
 
+def _deep_copy_nested_list(data):
+    if isinstance(data, (int, float)):
+        return float(data)
+    if isinstance(data, list):
+        res = []
+        for item in data:
+            res.append(_deep_copy_nested_list(item))
+        return res
+    return data
+
+
 def _create_zeros_like(data):
     if isinstance(data, (int, float)):
         return 0.0
@@ -48,6 +59,16 @@ class SGD:
                 for r in range(rows):
                     for c in range(cols):
                         p.data[r][c] = p.data[r][c] - self.lr * p.grad[r][c]
+
+    def state_dict(self):
+        return {
+            "type": "SGD",
+            "lr": self.lr
+        }
+
+    def load_state_dict(self, state_dict):
+        if "lr" in state_dict:
+            self.lr = float(state_dict["lr"])
 
 
 class Adam:
@@ -127,3 +148,40 @@ class Adam:
 
                         step_size = self.lr * m_hat / (math.sqrt(v_hat) + self.eps)
                         p.data[r][c] = p.data[r][c] - step_size
+
+    def state_dict(self):
+        m_copies = []
+        for item in self.m:
+            m_copies.append(_deep_copy_nested_list(item))
+
+        v_copies = []
+        for item in self.v:
+            v_copies.append(_deep_copy_nested_list(item))
+
+        return {
+            "type": "Adam",
+            "lr": self.lr,
+            "beta1": self.beta1,
+            "beta2": self.beta2,
+            "eps": self.eps,
+            "t": self.t,
+            "m": m_copies,
+            "v": v_copies,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.lr = float(state_dict.get("lr", self.lr))
+        self.beta1 = float(state_dict.get("beta1", self.beta1))
+        self.beta2 = float(state_dict.get("beta2", self.beta2))
+        self.eps = float(state_dict.get("eps", self.eps))
+        self.t = int(state_dict.get("t", self.t))
+
+        if "m" in state_dict:
+            self.m = []
+            for item in state_dict["m"]:
+                self.m.append(_deep_copy_nested_list(item))
+
+        if "v" in state_dict:
+            self.v = []
+            for item in state_dict["v"]:
+                self.v.append(_deep_copy_nested_list(item))
