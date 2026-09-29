@@ -10,6 +10,7 @@ from slowtorch.nn import (
     MSELoss,
     Softmax,
     CrossEntropyLoss,
+    clip_grad_norm_,
 )
 from slowtorch.optim import SGD, Adam
 
@@ -28,6 +29,7 @@ __all__ = [
     "MSELoss",
     "Softmax",
     "CrossEntropyLoss",
+    "clip_grad_norm_",
     "SGD",
     "Adam",
 ]
