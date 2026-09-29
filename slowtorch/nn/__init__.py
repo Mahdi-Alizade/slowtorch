@@ -1,5 +1,4 @@
-from slowtorch.nn.utils import clip_grad_norm_
-from slowtorch.nn import (
+from slowtorch.nn.modules import (
     Module,
     Sequential,
     Parameter,
@@ -11,6 +10,7 @@ from slowtorch.nn import (
     Softmax,
     CrossEntropyLoss,
 )
+from slowtorch.nn.utils import clip_grad_norm_
 
 __all__ = [
     "Module",
