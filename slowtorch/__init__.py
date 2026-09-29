@@ -15,6 +15,7 @@ from slowtorch.nn import (
 )
 from slowtorch.optim import SGD, Adam, StepLR
 from slowtorch.data import Dataset, TensorDataset, DataLoader
+from slowtorch.checkpoint import save_checkpoint, load_checkpoint
 
 __all__ = [
     "Tensor",
@@ -39,4 +40,6 @@ __all__ = [
     "Dataset",
     "TensorDataset",
     "DataLoader",
+    "save_checkpoint",
+    "load_checkpoint",
 ]
