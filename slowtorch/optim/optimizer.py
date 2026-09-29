@@ -59,9 +59,7 @@ class Adam:
         self.eps = float(eps)
 
         self.t = 0
-        # First moment vector (mean)
         self.m = []
-        # Second moment vector (uncentered variance)
         self.v = []
 
         for p in self.params:
@@ -92,7 +90,6 @@ class Adam:
             if p.grad is None:
                 continue
 
-            # Scalar parameter
             if p.shape == ():
                 g = p.grad
                 self.m[idx] = self.beta1 * self.m[idx] + (1.0 - self.beta1) * g
@@ -104,7 +101,6 @@ class Adam:
                 step_size = self.lr * m_hat / (math.sqrt(v_hat) + self.eps)
                 p.data = p.data - step_size
 
-            # 1D Vector parameter (e.g. bias)
             elif len(p.shape) == 1:
                 for i in range(len(p.data)):
                     g = p.grad[i]
@@ -117,7 +113,6 @@ class Adam:
                     step_size = self.lr * m_hat / (math.sqrt(v_hat) + self.eps)
                     p.data[i] = p.data[i] - step_size
 
-            # 2D Matrix parameter (e.g. weights)
             elif len(p.shape) == 2:
                 rows = p.shape[0]
                 cols = p.shape[1]
