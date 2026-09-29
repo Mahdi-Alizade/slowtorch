@@ -1,4 +1,39 @@
 import math
+from functools import wraps
+
+# Global gradient tracking flag
+_grad_enabled = True
+
+
+def is_grad_enabled():
+    global _grad_enabled
+    return _grad_enabled
+
+
+def set_grad_enabled(mode):
+    global _grad_enabled
+    _grad_enabled = bool(mode)
+
+
+class no_grad:
+    def __init__(self):
+        self.prev = True
+
+    def __enter__(self):
+        global _grad_enabled
+        self.prev = _grad_enabled
+        _grad_enabled = False
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _grad_enabled
+        _grad_enabled = self.prev
+
+    def __call__(self, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self:
+                return func(*args, **kwargs)
+        return wrapper
 
 
 def _zeros_like_shape(shape):
@@ -75,10 +110,14 @@ class Tensor:
         else:
             raise TypeError("Unsupported data type for Tensor: " + str(type(data)))
 
-        self.requires_grad = requires_grad
+        # Track gradient only if user requested AND global tracking is enabled
+        self.requires_grad = requires_grad and _grad_enabled
         self.grad = None
         self._backward = lambda: None
-        self._prev = set(_parents)
+        if _grad_enabled:
+            self._prev = set(_parents)
+        else:
+            self._prev = set()
         self._op = _op
 
     def __repr__(self):
@@ -92,22 +131,25 @@ class Tensor:
         if not isinstance(other, Tensor):
             other = Tensor(other)
 
+        req_grad = _grad_enabled and (self.requires_grad or other.requires_grad)
+
         if self.shape == () and other.shape == ():
             result_val = self.data + other.data
-            out = Tensor(result_val, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
+            out = Tensor(result_val, requires_grad=req_grad, _parents=(self, other), _op="+")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = 0.0
-                    self.grad = self.grad + 1.0 * out.grad
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = 0.0
+                        self.grad = self.grad + 1.0 * out.grad
 
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = 0.0
-                    other.grad = other.grad + 1.0 * out.grad
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = 0.0
+                        other.grad = other.grad + 1.0 * out.grad
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         elif len(self.shape) == 1 and len(other.shape) == 1:
@@ -119,22 +161,23 @@ class Tensor:
                 summed = val_a + val_b
                 new_data.append(summed)
 
-            out = Tensor(new_data, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
+            out = Tensor(new_data, requires_grad=req_grad, _parents=(self, other), _op="+")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = [0.0] * len(out.grad)
-                    for i in range(len(out.grad)):
-                        self.grad[i] = self.grad[i] + out.grad[i]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = [0.0] * len(out.grad)
+                        for i in range(len(out.grad)):
+                            self.grad[i] = self.grad[i] + out.grad[i]
 
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = [0.0] * len(out.grad)
-                    for j in range(len(out.grad)):
-                        other.grad[j] = other.grad[j] + out.grad[j]
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = [0.0] * len(out.grad)
+                        for j in range(len(out.grad)):
+                            other.grad[j] = other.grad[j] + out.grad[j]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         elif len(self.shape) == 2 and len(other.shape) == 1:
@@ -151,26 +194,27 @@ class Tensor:
                     new_row.append(sum_val)
                 new_grid.append(new_row)
 
-            out = Tensor(new_grid, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
+            out = Tensor(new_grid, requires_grad=req_grad, _parents=(self, other), _op="+")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            self.grad[r][c] = self.grad[r][c] + out.grad[r][c]
-
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = [0.0] * cols
-                    for c in range(cols):
-                        bias_grad_sum = 0.0
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
                         for r in range(rows):
-                            bias_grad_sum = bias_grad_sum + out.grad[r][c]
-                        other.grad[c] = other.grad[c] + bias_grad_sum
+                            for c in range(cols):
+                                self.grad[r][c] = self.grad[r][c] + out.grad[r][c]
 
-            out._backward = _backward
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = [0.0] * cols
+                        for c in range(cols):
+                            bias_grad_sum = 0.0
+                            for r in range(rows):
+                                bias_grad_sum = bias_grad_sum + out.grad[r][c]
+                            other.grad[c] = other.grad[c] + bias_grad_sum
+
+                out._backward = _backward
             return out
 
         elif len(self.shape) == 2 and len(other.shape) == 2:
@@ -185,24 +229,25 @@ class Tensor:
                     new_row.append(self.data[r][c] + other.data[r][c])
                 new_grid.append(new_row)
 
-            out = Tensor(new_grid, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="+")
+            out = Tensor(new_grid, requires_grad=req_grad, _parents=(self, other), _op="+")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            self.grad[r][c] = self.grad[r][c] + out.grad[r][c]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                self.grad[r][c] = self.grad[r][c] + out.grad[r][c]
 
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = _zeros_like_shape(other.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            other.grad[r][c] = other.grad[r][c] + out.grad[r][c]
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = _zeros_like_shape(other.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                other.grad[r][c] = other.grad[r][c] + out.grad[r][c]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         else:
@@ -220,26 +265,27 @@ class Tensor:
         if not isinstance(other, Tensor):
             other = Tensor(other)
 
-        # Scalar * Scalar
+        req_grad = _grad_enabled and (self.requires_grad or other.requires_grad)
+
         if self.shape == () and other.shape == ():
             result_val = self.data * other.data
-            out = Tensor(result_val, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="*")
+            out = Tensor(result_val, requires_grad=req_grad, _parents=(self, other), _op="*")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = 0.0
-                    self.grad = self.grad + other.data * out.grad
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = 0.0
+                        self.grad = self.grad + other.data * out.grad
 
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = 0.0
-                    other.grad = other.grad + self.data * out.grad
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = 0.0
+                        other.grad = other.grad + self.data * out.grad
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
-        # 2D Matrix * Scalar
         elif len(self.shape) == 2 and other.shape == ():
             new_data = []
             rows = self.shape[0]
@@ -250,52 +296,52 @@ class Tensor:
                     row.append(self.data[r][c] * other.data)
                 new_data.append(row)
 
-            out = Tensor(new_data, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="*")
+            out = Tensor(new_data, requires_grad=req_grad, _parents=(self, other), _op="*")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            self.grad[r][c] = self.grad[r][c] + other.data * out.grad[r][c]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                self.grad[r][c] = self.grad[r][c] + other.data * out.grad[r][c]
 
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = 0.0
-                    for r in range(rows):
-                        for c in range(cols):
-                            other.grad = other.grad + self.data[r][c] * out.grad[r][c]
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = 0.0
+                        for r in range(rows):
+                            for c in range(cols):
+                                other.grad = other.grad + self.data[r][c] * out.grad[r][c]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
-        # 1D Vector * 1D Vector (Element-wise)
         elif len(self.shape) == 1 and len(other.shape) == 1:
             new_data = []
             for i in range(len(self.data)):
                 mult_val = self.data[i] * other.data[i]
                 new_data.append(mult_val)
 
-            out = Tensor(new_data, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="*")
+            out = Tensor(new_data, requires_grad=req_grad, _parents=(self, other), _op="*")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = [0.0] * len(self.data)
-                    for i in range(len(self.data)):
-                        self.grad[i] = self.grad[i] + other.data[i] * out.grad[i]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = [0.0] * len(self.data)
+                        for i in range(len(self.data)):
+                            self.grad[i] = self.grad[i] + other.data[i] * out.grad[i]
 
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = [0.0] * len(other.data)
-                    for j in range(len(other.data)):
-                        other.grad[j] = other.grad[j] + self.data[j] * out.grad[j]
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = [0.0] * len(other.data)
+                        for j in range(len(other.data)):
+                            other.grad[j] = other.grad[j] + self.data[j] * out.grad[j]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
-        # 2D Matrix * 2D Matrix (Element-wise)
         elif len(self.shape) == 2 and len(other.shape) == 2:
             if self.shape != other.shape:
                 raise ValueError("Shape mismatch for element-wise multiplication: " + str(self.shape) + " vs " + str(other.shape))
@@ -308,24 +354,25 @@ class Tensor:
                     new_row.append(self.data[r][c] * other.data[r][c])
                 new_grid.append(new_row)
 
-            out = Tensor(new_grid, requires_grad=(self.requires_grad or other.requires_grad), _parents=(self, other), _op="*")
+            out = Tensor(new_grid, requires_grad=req_grad, _parents=(self, other), _op="*")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            self.grad[r][c] = self.grad[r][c] + other.data[r][c] * out.grad[r][c]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                self.grad[r][c] = self.grad[r][c] + other.data[r][c] * out.grad[r][c]
 
-                if other.requires_grad:
-                    if other.grad is None:
-                        other.grad = _zeros_like_shape(other.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            other.grad[r][c] = other.grad[r][c] + self.data[r][c] * out.grad[r][c]
+                    if other.requires_grad:
+                        if other.grad is None:
+                            other.grad = _zeros_like_shape(other.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                other.grad[r][c] = other.grad[r][c] + self.data[r][c] * out.grad[r][c]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         else:
@@ -335,41 +382,42 @@ class Tensor:
         if not isinstance(power, (int, float)):
             raise TypeError("Power must be an int or float, got " + str(type(power)))
 
-        # Scalar
+        req_grad = _grad_enabled and self.requires_grad
+
         if self.shape == ():
             val = self.data ** power
-            out = Tensor(val, requires_grad=self.requires_grad, _parents=(self,), _op="**" + str(power))
+            out = Tensor(val, requires_grad=req_grad, _parents=(self,), _op="**" + str(power))
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = 0.0
-                    local_grad = power * (self.data ** (power - 1))
-                    self.grad = self.grad + local_grad * out.grad
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = 0.0
+                        local_grad = power * (self.data ** (power - 1))
+                        self.grad = self.grad + local_grad * out.grad
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
-        # 1D Vector
         elif len(self.shape) == 1:
             out_data = []
             for item in self.data:
                 out_data.append(item ** power)
 
-            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="**" + str(power))
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self,), _op="**" + str(power))
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = [0.0] * len(self.data)
-                    for i in range(len(self.data)):
-                        local_grad = power * (self.data[i] ** (power - 1))
-                        self.grad[i] = self.grad[i] + local_grad * out.grad[i]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = [0.0] * len(self.data)
+                        for i in range(len(self.data)):
+                            local_grad = power * (self.data[i] ** (power - 1))
+                            self.grad[i] = self.grad[i] + local_grad * out.grad[i]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
-        # 2D Matrix
         elif len(self.shape) == 2:
             rows = self.shape[0]
             cols = self.shape[1]
@@ -380,18 +428,19 @@ class Tensor:
                     row_items.append(self.data[r][c] ** power)
                 out_data.append(row_items)
 
-            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="**" + str(power))
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self,), _op="**" + str(power))
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            local_grad = power * (self.data[r][c] ** (power - 1))
-                            self.grad[r][c] = self.grad[r][c] + local_grad * out.grad[r][c]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                local_grad = power * (self.data[r][c] ** (power - 1))
+                                self.grad[r][c] = self.grad[r][c] + local_grad * out.grad[r][c]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
         else:
             raise NotImplementedError("Power not implemented for shape: " + str(self.shape))
@@ -403,52 +452,57 @@ class Tensor:
         if len(self.shape) != 2 or len(other.shape) != 2:
             raise ValueError("matmul currently only supports 2D matrices, got " + str(self.shape) + " and " + str(other.shape))
 
+        req_grad = _grad_enabled and (self.requires_grad or other.requires_grad)
         res_data = _raw_matmul(self.data, other.data)
         out = Tensor(
             res_data,
-            requires_grad=(self.requires_grad or other.requires_grad),
+            requires_grad=req_grad,
             _parents=(self, other),
             _op="matmul",
         )
 
-        def _backward():
-            if self.requires_grad:
-                if self.grad is None:
-                    self.grad = _zeros_like_shape(self.shape)
-                other_t = _matrix_transpose(other.data)
-                grad_self = _raw_matmul(out.grad, other_t)
-                for r in range(len(self.grad)):
-                    for c in range(len(self.grad[0])):
-                        self.grad[r][c] = self.grad[r][c] + grad_self[r][c]
+        if req_grad:
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    other_t = _matrix_transpose(other.data)
+                    grad_self = _raw_matmul(out.grad, other_t)
+                    for r in range(len(self.grad)):
+                        for c in range(len(self.grad[0])):
+                            self.grad[r][c] = self.grad[r][c] + grad_self[r][c]
 
-            if other.requires_grad:
-                if other.grad is None:
-                    other.grad = _zeros_like_shape(other.shape)
-                self_t = _matrix_transpose(self.data)
-                grad_other = _raw_matmul(self_t, out.grad)
-                for r in range(len(other.grad)):
-                    for c in range(len(other.grad[0])):
-                        other.grad[r][c] = other.grad[r][c] + grad_other[r][c]
+                if other.requires_grad:
+                    if other.grad is None:
+                        other.grad = _zeros_like_shape(other.shape)
+                    self_t = _matrix_transpose(self.data)
+                    grad_other = _raw_matmul(self_t, out.grad)
+                    for r in range(len(other.grad)):
+                        for c in range(len(other.grad[0])):
+                            other.grad[r][c] = other.grad[r][c] + grad_other[r][c]
 
-        out._backward = _backward
+            out._backward = _backward
         return out
 
     def __matmul__(self, other):
         return self.matmul(other)
 
     def relu(self):
+        req_grad = _grad_enabled and self.requires_grad
+
         if self.shape == ():
             val = self.data if self.data > 0.0 else 0.0
-            out = Tensor(val, requires_grad=self.requires_grad, _parents=(self,), _op="relu")
+            out = Tensor(val, requires_grad=req_grad, _parents=(self,), _op="relu")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = 0.0
-                    local_derivative = 1.0 if self.data > 0.0 else 0.0
-                    self.grad = self.grad + local_derivative * out.grad
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = 0.0
+                        local_derivative = 1.0 if self.data > 0.0 else 0.0
+                        self.grad = self.grad + local_derivative * out.grad
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         elif len(self.shape) == 1:
@@ -459,17 +513,18 @@ class Tensor:
                 else:
                     out_data.append(0.0)
 
-            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="relu")
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self,), _op="relu")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = [0.0] * len(self.data)
-                    for i in range(len(self.data)):
-                        local_derivative = 1.0 if self.data[i] > 0.0 else 0.0
-                        self.grad[i] = self.grad[i] + local_derivative * out.grad[i]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = [0.0] * len(self.data)
+                        for i in range(len(self.data)):
+                            local_derivative = 1.0 if self.data[i] > 0.0 else 0.0
+                            self.grad[i] = self.grad[i] + local_derivative * out.grad[i]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         elif len(self.shape) == 2:
@@ -486,18 +541,19 @@ class Tensor:
                         row_items.append(0.0)
                 out_data.append(row_items)
 
-            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="relu")
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self,), _op="relu")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            local_derivative = 1.0 if self.data[r][c] > 0.0 else 0.0
-                            self.grad[r][c] = self.grad[r][c] + local_derivative * out.grad[r][c]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                local_derivative = 1.0 if self.data[r][c] > 0.0 else 0.0
+                                self.grad[r][c] = self.grad[r][c] + local_derivative * out.grad[r][c]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
         else:
             raise NotImplementedError("ReLU not implemented for shape: " + str(self.shape))
@@ -510,18 +566,21 @@ class Tensor:
                 return 1.0
             return 1.0 / (1.0 + math.exp(-x))
 
+        req_grad = _grad_enabled and self.requires_grad
+
         if self.shape == ():
             sig_val = _calc_sigmoid(self.data)
-            out = Tensor(sig_val, requires_grad=self.requires_grad, _parents=(self,), _op="sigmoid")
+            out = Tensor(sig_val, requires_grad=req_grad, _parents=(self,), _op="sigmoid")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = 0.0
-                    local_derivative = out.data * (1.0 - out.data)
-                    self.grad = self.grad + local_derivative * out.grad
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = 0.0
+                        local_derivative = out.data * (1.0 - out.data)
+                        self.grad = self.grad + local_derivative * out.grad
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         elif len(self.shape) == 1:
@@ -529,17 +588,18 @@ class Tensor:
             for item in self.data:
                 out_data.append(_calc_sigmoid(item))
 
-            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="sigmoid")
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self,), _op="sigmoid")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = [0.0] * len(self.data)
-                    for i in range(len(self.data)):
-                        local_derivative = out.data[i] * (1.0 - out.data[i])
-                        self.grad[i] = self.grad[i] + local_derivative * out.grad[i]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = [0.0] * len(self.data)
+                        for i in range(len(self.data)):
+                            local_derivative = out.data[i] * (1.0 - out.data[i])
+                            self.grad[i] = self.grad[i] + local_derivative * out.grad[i]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
 
         elif len(self.shape) == 2:
@@ -553,18 +613,19 @@ class Tensor:
                     row_items.append(_calc_sigmoid(elem))
                 out_data.append(row_items)
 
-            out = Tensor(out_data, requires_grad=self.requires_grad, _parents=(self,), _op="sigmoid")
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self,), _op="sigmoid")
 
-            def _backward():
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            local_derivative = out.data[r][c] * (1.0 - out.data[r][c])
-                            self.grad[r][c] = self.grad[r][c] + local_derivative * out.grad[r][c]
+            if req_grad:
+                def _backward():
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
+                        for r in range(rows):
+                            for c in range(cols):
+                                local_derivative = out.data[r][c] * (1.0 - out.data[r][c])
+                                self.grad[r][c] = self.grad[r][c] + local_derivative * out.grad[r][c]
 
-            out._backward = _backward
+                out._backward = _backward
             return out
         else:
             raise NotImplementedError("Sigmoid not implemented for shape: " + str(self.shape))
@@ -581,27 +642,29 @@ class Tensor:
                 for item in row:
                     total = total + item
 
-        out = Tensor(total, requires_grad=self.requires_grad, _parents=(self,), _op="sum")
+        req_grad = _grad_enabled and self.requires_grad
+        out = Tensor(total, requires_grad=req_grad, _parents=(self,), _op="sum")
 
-        def _backward():
-            if self.requires_grad:
-                if self.shape == ():
-                    if self.grad is None:
-                        self.grad = 0.0
-                    self.grad = self.grad + 1.0 * out.grad
-                elif len(self.shape) == 1:
-                    if self.grad is None:
-                        self.grad = [0.0] * len(self.data)
-                    for i in range(len(self.grad)):
-                        self.grad[i] = self.grad[i] + 1.0 * out.grad
-                elif len(self.shape) == 2:
-                    if self.grad is None:
-                        self.grad = _zeros_like_shape(self.shape)
-                    for r in range(len(self.grad)):
-                        for c in range(len(self.grad[0])):
-                            self.grad[r][c] = self.grad[r][c] + 1.0 * out.grad
+        if req_grad:
+            def _backward():
+                if self.requires_grad:
+                    if self.shape == ():
+                        if self.grad is None:
+                            self.grad = 0.0
+                        self.grad = self.grad + 1.0 * out.grad
+                    elif len(self.shape) == 1:
+                        if self.grad is None:
+                            self.grad = [0.0] * len(self.data)
+                        for i in range(len(self.grad)):
+                            self.grad[i] = self.grad[i] + 1.0 * out.grad
+                    elif len(self.shape) == 2:
+                        if self.grad is None:
+                            self.grad = _zeros_like_shape(self.shape)
+                        for r in range(len(self.grad)):
+                            for c in range(len(self.grad[0])):
+                                self.grad[r][c] = self.grad[r][c] + 1.0 * out.grad
 
-        out._backward = _backward
+            out._backward = _backward
         return out
 
     def mean(self):
