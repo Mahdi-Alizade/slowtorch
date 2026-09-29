@@ -1,7 +1,6 @@
 import math
 from functools import wraps
 
-# Global gradient tracking flag
 _grad_enabled = True
 
 
@@ -57,6 +56,37 @@ def _zeros_like_shape(shape):
     raise ValueError("Shapes higher than 2D not implemented yet: " + str(shape))
 
 
+def _flatten_list(nested):
+    if not isinstance(nested, list):
+        return [nested]
+    flat = []
+    for item in nested:
+        if isinstance(item, list):
+            flat.extend(_flatten_list(item))
+        else:
+            flat.append(item)
+    return flat
+
+
+def _unflatten_to_shape(flat_list, target_shape):
+    if len(target_shape) == 0:
+        return flat_list[0]
+    if len(target_shape) == 1:
+        return list(flat_list)
+    if len(target_shape) == 2:
+        rows, cols = target_shape
+        out = []
+        idx = 0
+        for _ in range(rows):
+            row = []
+            for _ in range(cols):
+                row.append(flat_list[idx])
+                idx = idx + 1
+            out.append(row)
+        return out
+    raise NotImplementedError("Shapes beyond 2D not supported: " + str(target_shape))
+
+
 def _matrix_transpose(mat):
     rows = len(mat)
     cols = len(mat[0])
@@ -110,7 +140,6 @@ class Tensor:
         else:
             raise TypeError("Unsupported data type for Tensor: " + str(type(data)))
 
-        # Track gradient only if user requested AND global tracking is enabled
         self.requires_grad = requires_grad and _grad_enabled
         self.grad = None
         self._backward = lambda: None
@@ -487,6 +516,103 @@ class Tensor:
     def __matmul__(self, other):
         return self.matmul(other)
 
+    def reshape(self, *shape):
+        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+            target_shape = tuple(shape[0])
+        else:
+            target_shape = tuple(shape)
+
+        flat_elements = _flatten_list(self.data) if isinstance(self.data, list) else [self.data]
+        total_elements = len(flat_elements)
+
+        # Handle negative dimension inference (e.g. -1)
+        inferred = []
+        neg_idx = -1
+        known_product = 1
+
+        for i, dim in enumerate(target_shape):
+            if dim == -1:
+                if neg_idx != -1:
+                    raise ValueError("Can only specify one unknown dimension in reshape")
+                neg_idx = i
+                inferred.append(None)
+            elif dim > 0:
+                known_product = known_product * dim
+                inferred.append(dim)
+            else:
+                raise ValueError("Invalid dimension size: " + str(dim))
+
+        if neg_idx != -1:
+            if known_product == 0 or total_elements % known_product != 0:
+                raise ValueError("Cannot infer dimension for total elements " + str(total_elements) + " with shape " + str(target_shape))
+            inferred[neg_idx] = total_elements // known_product
+
+        final_shape = tuple(inferred)
+
+        check_prod = 1
+        for dim in final_shape:
+            check_prod = check_prod * dim
+        if check_prod != total_elements:
+            raise ValueError("Total elements " + str(total_elements) + " does not match target shape " + str(final_shape))
+
+        reshaped_data = _unflatten_to_shape(flat_elements, final_shape)
+        req_grad = _grad_enabled and self.requires_grad
+
+        out = Tensor(reshaped_data, requires_grad=req_grad, _parents=(self,), _op="reshape")
+
+        if req_grad:
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+
+                    # Flatten output grad and reshape it back to self.shape
+                    flat_out_grad = _flatten_list(out.grad) if isinstance(out.grad, list) else [out.grad]
+                    restored_grad = _unflatten_to_shape(flat_out_grad, self.shape)
+
+                    if self.shape == ():
+                        self.grad = self.grad + restored_grad
+                    elif len(self.shape) == 1:
+                        for i in range(len(self.grad)):
+                            self.grad[i] = self.grad[i] + restored_grad[i]
+                    elif len(self.shape) == 2:
+                        for r in range(len(self.grad)):
+                            for c in range(len(self.grad[0])):
+                                self.grad[r][c] = self.grad[r][c] + restored_grad[r][c]
+
+            out._backward = _backward
+        return out
+
+    def transpose(self, dim0=0, dim1=1):
+        if len(self.shape) != 2:
+            raise NotImplementedError("transpose currently only implemented for 2D tensors, got shape " + str(self.shape))
+
+        if {dim0, dim1} != {0, 1}:
+            raise ValueError("For 2D tensor, transpose dimensions must be 0 and 1, got " + str((dim0, dim1)))
+
+        transposed_data = _matrix_transpose(self.data)
+        req_grad = _grad_enabled and self.requires_grad
+
+        out = Tensor(transposed_data, requires_grad=req_grad, _parents=(self,), _op="transpose")
+
+        if req_grad:
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+                    # Transposing out.grad aligns back to self.shape
+                    grad_restored = _matrix_transpose(out.grad)
+                    for r in range(len(self.grad)):
+                        for c in range(len(self.grad[0])):
+                            self.grad[r][c] = self.grad[r][c] + grad_restored[r][c]
+
+            out._backward = _backward
+        return out
+
+    @property
+    def T(self):
+        return self.transpose(0, 1)
+
     def relu(self):
         req_grad = _grad_enabled and self.requires_grad
 
@@ -655,7 +781,7 @@ class Tensor:
                     elif len(self.shape) == 1:
                         if self.grad is None:
                             self.grad = [0.0] * len(self.data)
-                        for i in range(len(self.grad)):
+                        for i in range(len(self.data)):
                             self.grad[i] = self.grad[i] + 1.0 * out.grad
                     elif len(self.shape) == 2:
                         if self.grad is None:
