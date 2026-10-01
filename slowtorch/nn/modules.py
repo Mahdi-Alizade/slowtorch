@@ -111,15 +111,7 @@ class Module:
     def zero_grad(self):
         for p in self.parameters():
             if p.grad is not None:
-                if p.shape == ():
-                    p.grad = 0.0
-                elif len(p.shape) == 1:
-                    for i in range(len(p.grad)):
-                        p.grad[i] = 0.0
-                elif len(p.shape) == 2:
-                    for r in range(len(p.grad)):
-                        for c in range(len(p.grad[0])):
-                            p.grad[r][c] = 0.0
+                p.grad = _zeros_like_shape(p.shape)
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Forward pass must be implemented by subclasses")
@@ -185,6 +177,186 @@ class Linear(Module):
         return out
 
 
+class Conv2d(Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        if isinstance(kernel_size, int):
+            self.kernel_size = (kernel_size, kernel_size)
+        else:
+            self.kernel_size = tuple(kernel_size)
+
+        if isinstance(stride, int):
+            self.stride = (stride, stride)
+        else:
+            self.stride = tuple(stride)
+
+        if isinstance(padding, int):
+            self.padding = (padding, padding)
+        else:
+            self.padding = tuple(padding)
+
+        self.use_bias = bias
+
+        kh, kw = self.kernel_size
+        fan_in = in_channels * kh * kw
+        bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 1.0
+
+        # Weight shape: (out_channels, in_channels, kh, kw)
+        weight_data = []
+        for _ in range(out_channels):
+            c_in_cube = []
+            for _ in range(in_channels):
+                plane = []
+                for _ in range(kh):
+                    row = []
+                    for _ in range(kw):
+                        val = random.uniform(-bound, bound)
+                        row.append(val)
+                    plane.append(row)
+                c_in_cube.append(plane)
+            weight_data.append(c_in_cube)
+
+        self.weight = Parameter(weight_data)
+
+        if self.use_bias:
+            bias_data = [0.0] * out_channels
+            self.bias = Parameter(bias_data)
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        if len(x.shape) != 4:
+            raise ValueError("Conv2d expects 4D input of shape (batch, in_channels, height, width), got shape " + str(x.shape))
+
+        batch_size, in_c, in_h, in_w = x.shape
+        if in_c != self.in_channels:
+            raise ValueError("Input channels (" + str(in_c) + ") does not match layer in_channels (" + str(self.in_channels) + ")")
+
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        pad_h, pad_w = self.padding
+
+        out_h = (in_h + 2 * pad_h - kh) // sh + 1
+        out_w = (in_w + 2 * pad_w - kw) // sw + 1
+
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError("Calculated Conv2d output dimension is non-positive: (" + str(out_h) + ", " + str(out_w) + ")")
+
+        # Padded input preparation
+        padded_h = in_h + 2 * pad_h
+        padded_w = in_w + 2 * pad_w
+
+        padded_input = []
+        for n in range(batch_size):
+            n_cube = []
+            for c in range(in_c):
+                c_plane = []
+                for h in range(padded_h):
+                    row = []
+                    for w in range(padded_w):
+                        orig_h = h - pad_h
+                        orig_w = w - pad_w
+                        if 0 <= orig_h < in_h and 0 <= orig_w < in_w:
+                            row.append(x.data[n][c][orig_h][orig_w])
+                        else:
+                            row.append(0.0)
+                    c_plane.append(row)
+                n_cube.append(c_plane)
+            padded_input.append(n_cube)
+
+        # Forward convolution computation
+        out_data = []
+        for n in range(batch_size):
+            n_out = []
+            for cout in range(self.out_channels):
+                cout_plane = []
+                bias_val = self.bias.data[cout] if self.bias is not None else 0.0
+                for oh in range(out_h):
+                    row = []
+                    for ow in range(out_w):
+                        h_start = oh * sh
+                        w_start = ow * sw
+                        acc = bias_val
+                        for cin in range(in_c):
+                            for rk in range(kh):
+                                for ck in range(kw):
+                                    in_val = padded_input[n][cin][h_start + rk][w_start + ck]
+                                    w_val = self.weight.data[cout][cin][rk][ck]
+                                    acc = acc + in_val * w_val
+                        row.append(acc)
+                    cout_plane.append(row)
+                n_out.append(cout_plane)
+            out_data.append(n_out)
+
+        parents = [x, self.weight]
+        req_grad = x.requires_grad or self.weight.requires_grad
+        if self.bias is not None:
+            parents.append(self.bias)
+            req_grad = req_grad or self.bias.requires_grad
+
+        out = Tensor(out_data, requires_grad=req_grad, _parents=tuple(parents), _op="conv2d")
+
+        def _backward():
+            # 1. Gradient with respect to Bias
+            if self.bias is not None and self.bias.requires_grad:
+                if self.bias.grad is None:
+                    self.bias.grad = [0.0] * self.out_channels
+                for cout in range(self.out_channels):
+                    bias_acc = 0.0
+                    for n in range(batch_size):
+                        for oh in range(out_h):
+                            for ow in range(out_w):
+                                bias_acc = bias_acc + out.grad[n][cout][oh][ow]
+                    self.bias.grad[cout] = self.bias.grad[cout] + bias_acc
+
+            # 2. Gradient with respect to Weights
+            if self.weight.requires_grad:
+                if self.weight.grad is None:
+                    self.weight.grad = _zeros_like_shape(self.weight.shape)
+                for cout in range(self.out_channels):
+                    for cin in range(in_c):
+                        for rk in range(kh):
+                            for ck in range(kw):
+                                dw_acc = 0.0
+                                for n in range(batch_size):
+                                    for oh in range(out_h):
+                                        h_in = oh * sh + rk
+                                        for ow in range(out_w):
+                                            w_in = ow * sw + ck
+                                            og = out.grad[n][cout][oh][ow]
+                                            dw_acc = dw_acc + og * padded_input[n][cin][h_in][w_in]
+                                self.weight.grad[cout][cin][rk][ck] = self.weight.grad[cout][cin][rk][ck] + dw_acc
+
+            # 3. Gradient with respect to Input x
+            if x.requires_grad:
+                if x.grad is None:
+                    x.grad = _zeros_like_shape(x.shape)
+
+                # Accumulate back into padded coordinates, then strip padding
+                for n in range(batch_size):
+                    for cout in range(self.out_channels):
+                        for oh in range(out_h):
+                            h_start = oh * sh
+                            for ow in range(out_w):
+                                w_start = ow * sw
+                                og = out.grad[n][cout][oh][ow]
+                                for cin in range(in_c):
+                                    for rk in range(kh):
+                                        h_actual = h_start + rk - pad_h
+                                        if 0 <= h_actual < in_h:
+                                            for ck in range(kw):
+                                                w_actual = w_start + ck - pad_w
+                                                if 0 <= w_actual < in_w:
+                                                    w_val = self.weight.data[cout][cin][rk][ck]
+                                                    x.grad[n][cin][h_actual][w_actual] = x.grad[n][cin][h_actual][w_actual] + og * w_val
+
+        out._backward = _backward
+        return out
+
+
 class LayerNorm(Module):
     def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
         super().__init__()
@@ -200,7 +372,6 @@ class LayerNorm(Module):
         num_features = self.normalized_shape[0]
 
         if self.elementwise_affine:
-            # gamma initialized to 1.0, beta to 0.0
             gamma_data = [1.0] * num_features
             beta_data = [0.0] * num_features
             self.weight = Parameter(gamma_data)
@@ -225,13 +396,11 @@ class LayerNorm(Module):
         inv_std_list = []
 
         for r in range(rows):
-            # 1. Compute Mean
             mean_val = 0.0
             for c in range(cols):
                 mean_val = mean_val + x.data[r][c]
             mean_val = mean_val / dim
 
-            # 2. Compute Variance
             var_val = 0.0
             for c in range(cols):
                 diff = x.data[r][c] - mean_val
@@ -241,7 +410,6 @@ class LayerNorm(Module):
             inv_std = 1.0 / math.sqrt(var_val + self.eps)
             inv_std_list.append(inv_std)
 
-            # 3. Standardize and scale/shift
             out_row = []
             x_hat_row = []
             for c in range(cols):
@@ -266,7 +434,6 @@ class LayerNorm(Module):
         out = Tensor(normalized_grid, requires_grad=req_grad, _parents=tuple(parents), _op="layernorm")
 
         def _backward():
-            # Gradients with respect to gamma (weight) and beta (bias)
             if self.elementwise_affine:
                 if self.weight.requires_grad:
                     if self.weight.grad is None:
@@ -286,7 +453,6 @@ class LayerNorm(Module):
                             b_sum = b_sum + out.grad[r][c]
                         self.bias.grad[c] = self.bias.grad[c] + b_sum
 
-            # Gradients with respect to input x
             if x.requires_grad:
                 if x.grad is None:
                     x.grad = _zeros_like_shape(x.shape)
@@ -294,7 +460,6 @@ class LayerNorm(Module):
                 for r in range(rows):
                     inv_std = inv_std_list[r]
 
-                    # Compute dL/d(x_hat)
                     dl_dxhat = []
                     for c in range(cols):
                         if self.elementwise_affine:
@@ -302,14 +467,12 @@ class LayerNorm(Module):
                         else:
                             dl_dxhat.append(out.grad[r][c])
 
-                    # Compute intermediate sums: sum(dL/dx_hat) and sum(dL/dx_hat * x_hat)
                     sum_dl = 0.0
                     sum_dl_xhat = 0.0
                     for c in range(cols):
                         sum_dl = sum_dl + dl_dxhat[c]
                         sum_dl_xhat = sum_dl_xhat + dl_dxhat[c] * x_hat_grid[r][c]
 
-                    # Apply analytic gradient formula
                     for c in range(cols):
                         grad_term = dim * dl_dxhat[c] - sum_dl - x_hat_grid[r][c] * sum_dl_xhat
                         dx = (inv_std / dim) * grad_term
