@@ -204,7 +204,6 @@ class Conv2d(Module):
         fan_in = in_channels * kh * kw
         bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 1.0
 
-        # Weight shape: (out_channels, in_channels, kh, kw)
         weight_data = []
         for _ in range(out_channels):
             c_in_cube = []
@@ -245,7 +244,6 @@ class Conv2d(Module):
         if out_h <= 0 or out_w <= 0:
             raise ValueError("Calculated Conv2d output dimension is non-positive: (" + str(out_h) + ", " + str(out_w) + ")")
 
-        # Padded input preparation
         padded_h = in_h + 2 * pad_h
         padded_w = in_w + 2 * pad_w
 
@@ -267,7 +265,6 @@ class Conv2d(Module):
                 n_cube.append(c_plane)
             padded_input.append(n_cube)
 
-        # Forward convolution computation
         out_data = []
         for n in range(batch_size):
             n_out = []
@@ -300,7 +297,6 @@ class Conv2d(Module):
         out = Tensor(out_data, requires_grad=req_grad, _parents=tuple(parents), _op="conv2d")
 
         def _backward():
-            # 1. Gradient with respect to Bias
             if self.bias is not None and self.bias.requires_grad:
                 if self.bias.grad is None:
                     self.bias.grad = [0.0] * self.out_channels
@@ -312,7 +308,6 @@ class Conv2d(Module):
                                 bias_acc = bias_acc + out.grad[n][cout][oh][ow]
                     self.bias.grad[cout] = self.bias.grad[cout] + bias_acc
 
-            # 2. Gradient with respect to Weights
             if self.weight.requires_grad:
                 if self.weight.grad is None:
                     self.weight.grad = _zeros_like_shape(self.weight.shape)
@@ -330,12 +325,10 @@ class Conv2d(Module):
                                             dw_acc = dw_acc + og * padded_input[n][cin][h_in][w_in]
                                 self.weight.grad[cout][cin][rk][ck] = self.weight.grad[cout][cin][rk][ck] + dw_acc
 
-            # 3. Gradient with respect to Input x
             if x.requires_grad:
                 if x.grad is None:
                     x.grad = _zeros_like_shape(x.shape)
 
-                # Accumulate back into padded coordinates, then strip padding
                 for n in range(batch_size):
                     for cout in range(self.out_channels):
                         for oh in range(out_h):
@@ -352,6 +345,105 @@ class Conv2d(Module):
                                                 if 0 <= w_actual < in_w:
                                                     w_val = self.weight.data[cout][cin][rk][ck]
                                                     x.grad[n][cin][h_actual][w_actual] = x.grad[n][cin][h_actual][w_actual] + og * w_val
+
+        out._backward = _backward
+        return out
+
+
+class MaxPool2d(Module):
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            self.kernel_size = (kernel_size, kernel_size)
+        else:
+            self.kernel_size = tuple(kernel_size)
+
+        if stride is None:
+            self.stride = self.kernel_size
+        elif isinstance(stride, int):
+            self.stride = (stride, stride)
+        else:
+            self.stride = tuple(stride)
+
+        if isinstance(padding, int):
+            self.padding = (padding, padding)
+        else:
+            self.padding = tuple(padding)
+
+    def forward(self, x):
+        if len(x.shape) != 4:
+            raise ValueError("MaxPool2d expects 4D input of shape (batch, channels, height, width), got shape " + str(x.shape))
+
+        batch_size, channels, in_h, in_w = x.shape
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        pad_h, pad_w = self.padding
+
+        out_h = (in_h + 2 * pad_h - kh) // sh + 1
+        out_w = (in_w + 2 * pad_w - kw) // sw + 1
+
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError("Calculated MaxPool2d output dimension is non-positive: (" + str(out_h) + ", " + str(out_w) + ")")
+
+        # Track max index locations for exact backprop routing
+        # argmax_mask[n][c][oh][ow] = (orig_h, orig_w)
+        argmax_mask = []
+        out_data = []
+
+        for n in range(batch_size):
+            n_out = []
+            n_mask = []
+            for c in range(channels):
+                c_out = []
+                c_mask = []
+                for oh in range(out_h):
+                    row_out = []
+                    row_mask = []
+                    for ow in range(out_w):
+                        h_start = oh * sh - pad_h
+                        w_start = ow * sw - pad_w
+
+                        max_val = -float("inf")
+                        max_idx = (None, None)
+
+                        for rk in range(kh):
+                            curr_h = h_start + rk
+                            for ck in range(kw):
+                                curr_w = w_start + ck
+                                if 0 <= curr_h < in_h and 0 <= curr_w < in_w:
+                                    val = x.data[n][c][curr_h][curr_w]
+                                else:
+                                    val = -float("inf")
+
+                                if val > max_val:
+                                    max_val = val
+                                    max_idx = (curr_h, curr_w)
+
+                        row_out.append(max_val)
+                        row_mask.append(max_idx)
+
+                    c_out.append(row_out)
+                    c_mask.append(row_mask)
+                n_out.append(c_out)
+                n_mask.append(c_mask)
+            out_data.append(n_out)
+            argmax_mask.append(n_mask)
+
+        out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,), _op="maxpool2d")
+
+        def _backward():
+            if x.requires_grad:
+                if x.grad is None:
+                    x.grad = _zeros_like_shape(x.shape)
+
+                for n in range(batch_size):
+                    for c in range(channels):
+                        for oh in range(out_h):
+                            for ow in range(out_w):
+                                best_h, best_w = argmax_mask[n][c][oh][ow]
+                                if best_h is not None and best_w is not None:
+                                    og = out.grad[n][c][oh][ow]
+                                    x.grad[n][c][best_h][best_w] = x.grad[n][c][best_h][best_w] + og
 
         out._backward = _backward
         return out
