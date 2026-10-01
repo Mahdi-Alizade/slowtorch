@@ -12,6 +12,7 @@ from slowtorch.nn.modules import (
     CrossEntropyLoss,
 )
 from slowtorch.nn.utils import clip_grad_norm_
+from slowtorch.nn import functional as F
 
 __all__ = [
     "Module",
@@ -26,4 +27,5 @@ __all__ = [
     "Softmax",
     "CrossEntropyLoss",
     "clip_grad_norm_",
+    "F",
 ]
