@@ -12,6 +12,7 @@ from slowtorch.nn import (
     Softmax,
     CrossEntropyLoss,
     clip_grad_norm_,
+    F,
 )
 from slowtorch.optim import SGD, Adam, StepLR
 from slowtorch.data import Dataset, TensorDataset, DataLoader
@@ -34,6 +35,7 @@ __all__ = [
     "Softmax",
     "CrossEntropyLoss",
     "clip_grad_norm_",
+    "F",
     "SGD",
     "Adam",
     "StepLR",
