@@ -53,7 +53,34 @@ def _zeros_like_shape(shape):
                 row.append(0.0)
             grid.append(row)
         return grid
-    raise ValueError("Shapes higher than 2D not implemented yet: " + str(shape))
+    if len(shape) == 3:
+        d0, d1, d2 = shape
+        out3d = []
+        for _ in range(d0):
+            plane = []
+            for _ in range(d1):
+                row = []
+                for _ in range(d2):
+                    row.append(0.0)
+                plane.append(row)
+            out3d.append(plane)
+        return out3d
+    if len(shape) == 4:
+        d0, d1, d2, d3 = shape
+        out4d = []
+        for _ in range(d0):
+            cube = []
+            for _ in range(d1):
+                plane = []
+                for _ in range(d2):
+                    row = []
+                    for _ in range(d3):
+                        row.append(0.0)
+                    plane.append(row)
+                cube.append(plane)
+            out4d.append(cube)
+        return out4d
+    raise ValueError("Shapes higher than 4D not implemented: " + str(shape))
 
 
 def _flatten_list(nested):
@@ -84,7 +111,7 @@ def _unflatten_to_shape(flat_list, target_shape):
                 idx = idx + 1
             out.append(row)
         return out
-    raise NotImplementedError("Shapes beyond 2D not supported: " + str(target_shape))
+    raise NotImplementedError("Shapes beyond 2D unflatten not supported: " + str(target_shape))
 
 
 def _matrix_transpose(mat):
@@ -525,7 +552,6 @@ class Tensor:
         flat_elements = _flatten_list(self.data) if isinstance(self.data, list) else [self.data]
         total_elements = len(flat_elements)
 
-        # Handle negative dimension inference (e.g. -1)
         inferred = []
         neg_idx = -1
         known_product = 1
@@ -566,7 +592,6 @@ class Tensor:
                     if self.grad is None:
                         self.grad = _zeros_like_shape(self.shape)
 
-                    # Flatten output grad and reshape it back to self.shape
                     flat_out_grad = _flatten_list(out.grad) if isinstance(out.grad, list) else [out.grad]
                     restored_grad = _unflatten_to_shape(flat_out_grad, self.shape)
 
@@ -600,7 +625,6 @@ class Tensor:
                 if self.requires_grad:
                     if self.grad is None:
                         self.grad = _zeros_like_shape(self.shape)
-                    # Transposing out.grad aligns back to self.shape
                     grad_restored = _matrix_transpose(out.grad)
                     for r in range(len(self.grad)):
                         for c in range(len(self.grad[0])):
@@ -757,16 +781,10 @@ class Tensor:
             raise NotImplementedError("Sigmoid not implemented for shape: " + str(self.shape))
 
     def sum(self):
+        flat_items = _flatten_list(self.data) if isinstance(self.data, list) else [self.data]
         total = 0.0
-        if self.shape == ():
-            total = self.data
-        elif len(self.shape) == 1:
-            for item in self.data:
-                total = total + item
-        elif len(self.shape) == 2:
-            for row in self.data:
-                for item in row:
-                    total = total + item
+        for item in flat_items:
+            total = total + item
 
         req_grad = _grad_enabled and self.requires_grad
         out = Tensor(total, requires_grad=req_grad, _parents=(self,), _op="sum")
@@ -778,17 +796,18 @@ class Tensor:
                         if self.grad is None:
                             self.grad = 0.0
                         self.grad = self.grad + 1.0 * out.grad
-                    elif len(self.shape) == 1:
-                        if self.grad is None:
-                            self.grad = [0.0] * len(self.data)
-                        for i in range(len(self.data)):
-                            self.grad[i] = self.grad[i] + 1.0 * out.grad
-                    elif len(self.shape) == 2:
+                    else:
                         if self.grad is None:
                             self.grad = _zeros_like_shape(self.shape)
-                        for r in range(len(self.grad)):
-                            for c in range(len(self.grad[0])):
-                                self.grad[r][c] = self.grad[r][c] + 1.0 * out.grad
+                        # Traverse nested structure and accumulate gradient
+                        def _accumulate_ones(g_target, g_val):
+                            if isinstance(g_target, list):
+                                for idx in range(len(g_target)):
+                                    if isinstance(g_target[idx], list):
+                                        _accumulate_ones(g_target[idx], g_val)
+                                    else:
+                                        g_target[idx] = g_target[idx] + g_val
+                        _accumulate_ones(self.grad, 1.0 * out.grad)
 
             out._backward = _backward
         return out
@@ -819,17 +838,16 @@ class Tensor:
 
         if self.shape == ():
             self.grad = 1.0
-        elif len(self.shape) == 1:
-            self.grad = [1.0] * len(self.data)
-        elif len(self.shape) == 2:
-            rows = len(self.data)
-            cols = len(self.data[0])
-            self.grad = []
-            for _ in range(rows):
-                row = []
-                for _ in range(cols):
-                    row.append(1.0)
-                self.grad.append(row)
+        else:
+            self.grad = _zeros_like_shape(self.shape)
+            def _fill_ones(g_target):
+                if isinstance(g_target, list):
+                    for idx in range(len(g_target)):
+                        if isinstance(g_target[idx], list):
+                            _fill_ones(g_target[idx])
+                        else:
+                            g_target[idx] = 1.0
+            _fill_ones(self.grad)
 
         reversed_nodes = list(reversed(topo))
         for node in reversed_nodes:
