@@ -211,7 +211,6 @@ class Flatten(Module):
             flat_sample = _flatten_list(sample)
             flattened_rows.append(flat_sample)
 
-        features_len = len(flattened_rows[0])
         out = Tensor(
             flattened_rows,
             requires_grad=x.requires_grad,
@@ -224,7 +223,6 @@ class Flatten(Module):
                 if x.grad is None:
                     x.grad = _zeros_like_shape(x.shape)
 
-                # Reconstruct original multi-dimensional tensor gradient
                 flat_out_grad = _flatten_list(out.grad)
                 reconstructed_grad = _unflatten_to_original_shape(flat_out_grad, x.shape)
 
@@ -544,6 +542,165 @@ class MaxPool2d(Module):
 
         out._backward = _backward
         return out
+
+
+class RNNCell(Module):
+    def __init__(self, input_size, hidden_size, bias=True):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.use_bias = bias
+
+        bound = 1.0 / math.sqrt(hidden_size)
+
+        # Weight matrices: (input_size, hidden_size) and (hidden_size, hidden_size)
+        w_ih_data = []
+        for _ in range(input_size):
+            row = []
+            for _ in range(hidden_size):
+                row.append(random.uniform(-bound, bound))
+            w_ih_data.append(row)
+        self.weight_ih = Parameter(w_ih_data)
+
+        w_hh_data = []
+        for _ in range(hidden_size):
+            row = []
+            for _ in range(hidden_size):
+                row.append(random.uniform(-bound, bound))
+            w_hh_data.append(row)
+        self.weight_hh = Parameter(w_hh_data)
+
+        if self.use_bias:
+            b_ih_data = [0.0] * hidden_size
+            b_hh_data = [0.0] * hidden_size
+            self.bias_ih = Parameter(b_ih_data)
+            self.bias_hh = Parameter(b_hh_data)
+        else:
+            self.bias_ih = None
+            self.bias_hh = None
+
+    def forward(self, x, h=None):
+        # x is (batch_size, input_size)
+        batch_size = x.shape[0]
+
+        if h is None:
+            # Initialize hidden state with zeros
+            h_zeros = [[0.0] * self.hidden_size for _ in range(batch_size)]
+            h = Tensor(h_zeros, requires_grad=False)
+
+        # linear_ih = x @ weight_ih + bias_ih
+        ih = x @ self.weight_ih
+        if self.bias_ih is not None:
+            ih = ih + self.bias_ih
+
+        # linear_hh = h @ weight_hh + bias_hh
+        hh = h @ self.weight_hh
+        if self.bias_hh is not None:
+            hh = hh + self.bias_hh
+
+        pre_act = ih + hh
+        h_next = pre_act.tanh()
+        return h_next
+
+
+class RNN(Module):
+    def __init__(self, input_size, hidden_size, bias=True, batch_first=False):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        self.batch_first = batch_first
+
+        self.cell = RNNCell(input_size, hidden_size, bias=bias)
+
+    def forward(self, x, h_0=None):
+        # x shape: (seq_len, batch_size, input_size) if not batch_first
+        #          (batch_size, seq_len, input_size) if batch_first
+        if len(x.shape) != 3:
+            raise ValueError("RNN expects 3D input tensor, got shape " + str(x.shape))
+
+        if self.batch_first:
+            batch_size, seq_len, in_size = x.shape
+        else:
+            seq_len, batch_size, in_size = x.shape
+
+        if in_size != self.input_size:
+            raise ValueError("Input feature size (" + str(in_size) + ") does not match RNN input_size (" + str(self.input_size) + ")")
+
+        h_t = h_0
+
+        # Unroll over sequence length (BPTT is formed via dynamic autograd graph)
+        h_seq = []
+        for t in range(seq_len):
+            if self.batch_first:
+                # Slice time step t across all batch items: x[:, t, :]
+                step_data = [x.data[b][t] for b in range(batch_size)]
+            else:
+                # Slice time step t: x[t, :, :]
+                step_data = x.data[t]
+
+            x_t = Tensor(step_data, requires_grad=x.requires_grad, _parents=(x,), _op="slice_t")
+
+            # Link slice back to x in backward if requires_grad
+            if x.requires_grad:
+                t_idx = t
+                bf = self.batch_first
+
+                def _make_backward_slice(t_curr, b_flag, x_node):
+                    def _backward():
+                        if x_node.requires_grad:
+                            if x_node.grad is None:
+                                x_node.grad = _zeros_like_shape(x_node.shape)
+                            for b in range(batch_size):
+                                for feat in range(in_size):
+                                    if b_flag:
+                                        x_node.grad[b][t_curr][feat] = x_node.grad[b][t_curr][feat] + x_t.grad[b][feat]
+                                    else:
+                                        x_node.grad[t_curr][b][feat] = x_node.grad[t_curr][b][feat] + x_t.grad[b][feat]
+                    return _backward
+
+                x_t._backward = _make_backward_slice(t_idx, bf, x)
+
+            h_t = self.cell(x_t, h_t)
+            h_seq.append(h_t)
+
+        # Assemble output tensor across time steps
+        if self.batch_first:
+            # (batch_size, seq_len, hidden_size)
+            assembled_out = []
+            for b in range(batch_size):
+                b_seq = []
+                for t in range(seq_len):
+                    b_seq.append(h_seq[t].data[b])
+                assembled_out.append(b_seq)
+        else:
+            # (seq_len, batch_size, hidden_size)
+            assembled_out = [h_step.data for h_step in h_seq]
+
+        parents = tuple(h_seq)
+        out_req_grad = any(h_step.requires_grad for h_step in h_seq)
+        output = Tensor(assembled_out, requires_grad=out_req_grad, _parents=parents, _op="rnn_unroll")
+
+        if out_req_grad:
+            bf_flag = self.batch_first
+
+            def _backward():
+                for t in range(seq_len):
+                    h_step = h_seq[t]
+                    if h_step.requires_grad:
+                        if h_step.grad is None:
+                            h_step.grad = _zeros_like_shape(h_step.shape)
+                        for b in range(batch_size):
+                            for h_idx in range(self.hidden_size):
+                                if bf_flag:
+                                    h_step.grad[b][h_idx] = h_step.grad[b][h_idx] + output.grad[b][t][h_idx]
+                                else:
+                                    h_step.grad[b][h_idx] = h_step.grad[b][h_idx] + output.grad[t][b][h_idx]
+
+            output._backward = _backward
+
+        # Returns (output, final_hidden_state)
+        return output, h_t
 
 
 class LayerNorm(Module):
