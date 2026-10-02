@@ -1,7 +1,7 @@
 import math
 import random
 import json
-from slowtorch.tensor import Tensor, _zeros_like_shape
+from slowtorch.tensor import Tensor, _zeros_like_shape, _flatten_list
 
 
 def _deep_copy_nested_list(data):
@@ -13,6 +13,56 @@ def _deep_copy_nested_list(data):
             res.append(_deep_copy_nested_list(item))
         return res
     return data
+
+
+def _unflatten_to_original_shape(flat_list, shape):
+    if len(shape) == 0:
+        return flat_list[0]
+    if len(shape) == 1:
+        return list(flat_list)
+    if len(shape) == 2:
+        rows, cols = shape
+        out = []
+        idx = 0
+        for _ in range(rows):
+            row = []
+            for _ in range(cols):
+                row.append(flat_list[idx])
+                idx = idx + 1
+            out.append(row)
+        return out
+    if len(shape) == 3:
+        d0, d1, d2 = shape
+        out3d = []
+        idx = 0
+        for _ in range(d0):
+            plane = []
+            for _ in range(d1):
+                row = []
+                for _ in range(d2):
+                    row.append(flat_list[idx])
+                    idx = idx + 1
+                plane.append(row)
+            out3d.append(plane)
+        return out3d
+    if len(shape) == 4:
+        d0, d1, d2, d3 = shape
+        out4d = []
+        idx = 0
+        for _ in range(d0):
+            cube = []
+            for _ in range(d1):
+                plane = []
+                for _ in range(d2):
+                    row = []
+                    for _ in range(d3):
+                        row.append(flat_list[idx])
+                        idx = idx + 1
+                    plane.append(row)
+                cube.append(plane)
+            out4d.append(cube)
+        return out4d
+    raise NotImplementedError("Unflattening not implemented for shapes above 4D: " + str(shape))
 
 
 class Parameter(Tensor):
@@ -140,6 +190,55 @@ class Sequential(Module):
         out = x
         for layer in self._layers:
             out = layer(out)
+        return out
+
+
+class Flatten(Module):
+    def __init__(self, start_dim=1, end_dim=-1):
+        super().__init__()
+        self.start_dim = start_dim
+        self.end_dim = end_dim
+
+    def forward(self, x):
+        if len(x.shape) <= 1:
+            return x
+
+        batch_size = x.shape[0]
+        flattened_rows = []
+
+        for n in range(batch_size):
+            sample = x.data[n]
+            flat_sample = _flatten_list(sample)
+            flattened_rows.append(flat_sample)
+
+        features_len = len(flattened_rows[0])
+        out = Tensor(
+            flattened_rows,
+            requires_grad=x.requires_grad,
+            _parents=(x,),
+            _op="flatten"
+        )
+
+        def _backward():
+            if x.requires_grad:
+                if x.grad is None:
+                    x.grad = _zeros_like_shape(x.shape)
+
+                # Reconstruct original multi-dimensional tensor gradient
+                flat_out_grad = _flatten_list(out.grad)
+                reconstructed_grad = _unflatten_to_original_shape(flat_out_grad, x.shape)
+
+                def _accumulate(dest, src):
+                    if isinstance(dest, list):
+                        for i in range(len(dest)):
+                            if isinstance(dest[i], list):
+                                _accumulate(dest[i], src[i])
+                            else:
+                                dest[i] = dest[i] + src[i]
+
+                _accumulate(x.grad, reconstructed_grad)
+
+        out._backward = _backward
         return out
 
 
@@ -385,8 +484,6 @@ class MaxPool2d(Module):
         if out_h <= 0 or out_w <= 0:
             raise ValueError("Calculated MaxPool2d output dimension is non-positive: (" + str(out_h) + ", " + str(out_w) + ")")
 
-        # Track max index locations for exact backprop routing
-        # argmax_mask[n][c][oh][ow] = (orig_h, orig_w)
         argmax_mask = []
         out_data = []
 
