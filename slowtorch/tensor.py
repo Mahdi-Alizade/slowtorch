@@ -657,6 +657,49 @@ class Tensor:
             out._backward = _backward
         return out
 
+    def tanh(self):
+        def _calc_tanh(x):
+            if x < -50.0:
+                return -1.0
+            if x > 50.0:
+                return 1.0
+            return math.tanh(x)
+
+        req_grad = _grad_enabled and self.requires_grad
+
+        def _apply_tanh(data):
+            if isinstance(data, (int, float)):
+                return _calc_tanh(data)
+            return [_apply_tanh(item) for item in data]
+
+        out_data = _apply_tanh(self.data)
+        out = Tensor(out_data, requires_grad=req_grad, _parents=(self,), _op="tanh")
+
+        if req_grad:
+            def _backward():
+                if self.requires_grad:
+                    if self.grad is None:
+                        self.grad = _zeros_like_shape(self.shape)
+
+                    def _accum_tanh_grad(out_data_node, self_grad, out_grad):
+                        if isinstance(out_data_node, (int, float)):
+                            deriv = 1.0 - (out_data_node * out_data_node)
+                            return self_grad + deriv * out_grad
+                        for i in range(len(out_data_node)):
+                            if isinstance(out_data_node[i], list):
+                                _accum_tanh_grad(out_data_node[i], self_grad[i], out_grad[i])
+                            else:
+                                deriv = 1.0 - (out_data_node[i] * out_data_node[i])
+                                self_grad[i] = self_grad[i] + deriv * out_grad[i]
+
+                    if self.shape == ():
+                        self.grad = _accum_tanh_grad(out.data, self.grad, out.grad)
+                    else:
+                        _accum_tanh_grad(out.data, self.grad, out.grad)
+
+            out._backward = _backward
+        return out
+
     def sum(self):
         flat_items = _flatten_list(self.data) if isinstance(self.data, list) else [self.data]
         total = 0.0
