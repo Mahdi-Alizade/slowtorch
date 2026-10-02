@@ -553,7 +553,6 @@ class RNNCell(Module):
 
         bound = 1.0 / math.sqrt(hidden_size)
 
-        # Weight matrices: (input_size, hidden_size) and (hidden_size, hidden_size)
         w_ih_data = []
         for _ in range(input_size):
             row = []
@@ -580,20 +579,16 @@ class RNNCell(Module):
             self.bias_hh = None
 
     def forward(self, x, h=None):
-        # x is (batch_size, input_size)
         batch_size = x.shape[0]
 
         if h is None:
-            # Initialize hidden state with zeros
             h_zeros = [[0.0] * self.hidden_size for _ in range(batch_size)]
             h = Tensor(h_zeros, requires_grad=False)
 
-        # linear_ih = x @ weight_ih + bias_ih
         ih = x @ self.weight_ih
         if self.bias_ih is not None:
             ih = ih + self.bias_ih
 
-        # linear_hh = h @ weight_hh + bias_hh
         hh = h @ self.weight_hh
         if self.bias_hh is not None:
             hh = hh + self.bias_hh
@@ -614,8 +609,6 @@ class RNN(Module):
         self.cell = RNNCell(input_size, hidden_size, bias=bias)
 
     def forward(self, x, h_0=None):
-        # x shape: (seq_len, batch_size, input_size) if not batch_first
-        #          (batch_size, seq_len, input_size) if batch_first
         if len(x.shape) != 3:
             raise ValueError("RNN expects 3D input tensor, got shape " + str(x.shape))
 
@@ -628,20 +621,16 @@ class RNN(Module):
             raise ValueError("Input feature size (" + str(in_size) + ") does not match RNN input_size (" + str(self.input_size) + ")")
 
         h_t = h_0
-
-        # Unroll over sequence length (BPTT is formed via dynamic autograd graph)
         h_seq = []
+
         for t in range(seq_len):
             if self.batch_first:
-                # Slice time step t across all batch items: x[:, t, :]
                 step_data = [x.data[b][t] for b in range(batch_size)]
             else:
-                # Slice time step t: x[t, :, :]
                 step_data = x.data[t]
 
             x_t = Tensor(step_data, requires_grad=x.requires_grad, _parents=(x,), _op="slice_t")
 
-            # Link slice back to x in backward if requires_grad
             if x.requires_grad:
                 t_idx = t
                 bf = self.batch_first
@@ -664,9 +653,7 @@ class RNN(Module):
             h_t = self.cell(x_t, h_t)
             h_seq.append(h_t)
 
-        # Assemble output tensor across time steps
         if self.batch_first:
-            # (batch_size, seq_len, hidden_size)
             assembled_out = []
             for b in range(batch_size):
                 b_seq = []
@@ -674,7 +661,6 @@ class RNN(Module):
                     b_seq.append(h_seq[t].data[b])
                 assembled_out.append(b_seq)
         else:
-            # (seq_len, batch_size, hidden_size)
             assembled_out = [h_step.data for h_step in h_seq]
 
         parents = tuple(h_seq)
@@ -699,8 +685,222 @@ class RNN(Module):
 
             output._backward = _backward
 
-        # Returns (output, final_hidden_state)
         return output, h_t
+
+
+class LSTMCell(Module):
+    def __init__(self, input_size, hidden_size, bias=True):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.use_bias = bias
+
+        bound = 1.0 / math.sqrt(hidden_size)
+
+        # 4 gates: input gate (i), forget gate (f), cell gate (g), output gate (o)
+        # Dimensions: (input_size, 4 * hidden_size) and (hidden_size, 4 * hidden_size)
+        w_ih_data = []
+        for _ in range(input_size):
+            row = []
+            for _ in range(4 * hidden_size):
+                row.append(random.uniform(-bound, bound))
+            w_ih_data.append(row)
+        self.weight_ih = Parameter(w_ih_data)
+
+        w_hh_data = []
+        for _ in range(hidden_size):
+            row = []
+            for _ in range(4 * hidden_size):
+                row.append(random.uniform(-bound, bound))
+            w_hh_data.append(row)
+        self.weight_hh = Parameter(w_hh_data)
+
+        if self.use_bias:
+            b_ih_data = [0.0] * (4 * hidden_size)
+            b_hh_data = [0.0] * (4 * hidden_size)
+            self.bias_ih = Parameter(b_ih_data)
+            self.bias_hh = Parameter(b_hh_data)
+        else:
+            self.bias_ih = None
+            self.bias_hh = None
+
+    def forward(self, x, states=None):
+        # x is (batch_size, input_size)
+        batch_size = x.shape[0]
+        h_dim = self.hidden_size
+
+        if states is None:
+            h_zeros = [[0.0] * h_dim for _ in range(batch_size)]
+            c_zeros = [[0.0] * h_dim for _ in range(batch_size)]
+            h = Tensor(h_zeros, requires_grad=False)
+            c = Tensor(c_zeros, requires_grad=False)
+        else:
+            h, c = states
+
+        # gates_linear = x @ weight_ih + h @ weight_hh + bias_ih + bias_hh
+        # shape: (batch_size, 4 * hidden_size)
+        gates = x @ self.weight_ih
+        if self.bias_ih is not None:
+            gates = gates + self.bias_ih
+
+        h_proj = h @ self.weight_hh
+        if self.bias_hh is not None:
+            h_proj = h_proj + self.bias_hh
+
+        gates = gates + h_proj
+
+        # Split 4 gates for each sample: i, f, g, o
+        # We perform gate slice and activations via sub-tensors
+        i_data = []
+        f_data = []
+        g_data = []
+        o_data = []
+
+        for b in range(batch_size):
+            row = gates.data[b]
+            i_data.append(row[0 : h_dim])
+            f_data.append(row[h_dim : 2 * h_dim])
+            g_data.append(row[2 * h_dim : 3 * h_dim])
+            o_data.append(row[3 * h_dim : 4 * h_dim])
+
+        # Slice nodes linked in dynamic DAG
+        req_grad = gates.requires_grad
+        i_gate_pre = Tensor(i_data, requires_grad=req_grad, _parents=(gates,), _op="slice_i")
+        f_gate_pre = Tensor(f_data, requires_grad=req_grad, _parents=(gates,), _op="slice_f")
+        g_gate_pre = Tensor(g_data, requires_grad=req_grad, _parents=(gates,), _op="slice_g")
+        o_gate_pre = Tensor(o_data, requires_grad=req_grad, _parents=(gates,), _op="slice_o")
+
+        if req_grad:
+            def _backward_gates_slice():
+                if gates.requires_grad:
+                    if gates.grad is None:
+                        gates.grad = _zeros_like_shape(gates.shape)
+                    for b in range(batch_size):
+                        for k in range(h_dim):
+                            if i_gate_pre.grad is not None:
+                                gates.grad[b][k] = gates.grad[b][k] + i_gate_pre.grad[b][k]
+                            if f_gate_pre.grad is not None:
+                                gates.grad[b][h_dim + k] = gates.grad[b][h_dim + k] + f_gate_pre.grad[b][k]
+                            if g_gate_pre.grad is not None:
+                                gates.grad[b][2 * h_dim + k] = gates.grad[b][2 * h_dim + k] + g_gate_pre.grad[b][k]
+                            if o_gate_pre.grad is not None:
+                                gates.grad[b][3 * h_dim + k] = gates.grad[b][3 * h_dim + k] + o_gate_pre.grad[b][k]
+
+            i_gate_pre._backward = _backward_gates_slice
+            f_gate_pre._backward = _backward_gates_slice
+            g_gate_pre._backward = _backward_gates_slice
+            o_gate_pre._backward = _backward_gates_slice
+
+        # Compute Gate Activations
+        i_gate = i_gate_pre.sigmoid()
+        f_gate = f_gate_pre.sigmoid()
+        g_gate = g_gate_pre.tanh()
+        o_gate = o_gate_pre.sigmoid()
+
+        # Update Cell State: c_next = f * c + i * g
+        c_next = (f_gate * c) + (i_gate * g_gate)
+
+        # Update Hidden State: h_next = o * tanh(c_next)
+        h_next = o_gate * c_next.tanh()
+
+        return h_next, c_next
+
+
+class LSTM(Module):
+    def __init__(self, input_size, hidden_size, bias=True, batch_first=False):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        self.batch_first = batch_first
+
+        self.cell = LSTMCell(input_size, hidden_size, bias=bias)
+
+    def forward(self, x, states_0=None):
+        if len(x.shape) != 3:
+            raise ValueError("LSTM expects 3D input tensor, got shape " + str(x.shape))
+
+        if self.batch_first:
+            batch_size, seq_len, in_size = x.shape
+        else:
+            seq_len, batch_size, in_size = x.shape
+
+        if in_size != self.input_size:
+            raise ValueError("Input feature size (" + str(in_size) + ") does not match LSTM input_size (" + str(self.input_size) + ")")
+
+        if states_0 is None:
+            h_t = None
+            c_t = None
+        else:
+            h_t, c_t = states_0
+
+        h_seq = []
+
+        for t in range(seq_len):
+            if self.batch_first:
+                step_data = [x.data[b][t] for b in range(batch_size)]
+            else:
+                step_data = x.data[t]
+
+            x_t = Tensor(step_data, requires_grad=x.requires_grad, _parents=(x,), _op="slice_t")
+
+            if x.requires_grad:
+                t_idx = t
+                bf = self.batch_first
+
+                def _make_backward_slice(t_curr, b_flag, x_node):
+                    def _backward():
+                        if x_node.requires_grad:
+                            if x_node.grad is None:
+                                x_node.grad = _zeros_like_shape(x_node.shape)
+                            for b in range(batch_size):
+                                for feat in range(in_size):
+                                    if b_flag:
+                                        x_node.grad[b][t_curr][feat] = x_node.grad[b][t_curr][feat] + x_t.grad[b][feat]
+                                    else:
+                                        x_node.grad[t_curr][b][feat] = x_node.grad[t_curr][b][feat] + x_t.grad[b][feat]
+                    return _backward
+
+                x_t._backward = _make_backward_slice(t_idx, bf, x)
+
+            curr_states = (h_t, c_t) if (h_t is not None and c_t is not None) else None
+            h_t, c_t = self.cell(x_t, curr_states)
+            h_seq.append(h_t)
+
+        if self.batch_first:
+            assembled_out = []
+            for b in range(batch_size):
+                b_seq = []
+                for t in range(seq_len):
+                    b_seq.append(h_seq[t].data[b])
+                assembled_out.append(b_seq)
+        else:
+            assembled_out = [h_step.data for h_step in h_seq]
+
+        parents = tuple(h_seq)
+        out_req_grad = any(h_step.requires_grad for h_step in h_seq)
+        output = Tensor(assembled_out, requires_grad=out_req_grad, _parents=parents, _op="lstm_unroll")
+
+        if out_req_grad:
+            bf_flag = self.batch_first
+
+            def _backward():
+                for t in range(seq_len):
+                    h_step = h_seq[t]
+                    if h_step.requires_grad:
+                        if h_step.grad is None:
+                            h_step.grad = _zeros_like_shape(h_step.shape)
+                        for b in range(batch_size):
+                            for h_idx in range(self.hidden_size):
+                                if bf_flag:
+                                    h_step.grad[b][h_idx] = h_step.grad[b][h_idx] + output.grad[b][t][h_idx]
+                                else:
+                                    h_step.grad[b][h_idx] = h_step.grad[b][h_idx] + output.grad[t][b][h_idx]
+
+            output._backward = _backward
+
+        # Returns (output, (h_n, c_n))
+        return output, (h_t, c_t)
 
 
 class LayerNorm(Module):
