@@ -643,6 +643,223 @@ class MaxPool2d(Module):
         return out
 
 
+class BatchNorm2d(Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super().__init__()
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.momentum = float(momentum)
+        self.affine = bool(affine)
+        self.track_running_stats = bool(track_running_stats)
+
+        if self.affine:
+            self.weight = Parameter([1.0] * self.num_features)
+            self.bias = Parameter([0.0] * self.num_features)
+        else:
+            self.weight = None
+            self.bias = None
+
+        if self.track_running_stats:
+            self.running_mean = [0.0] * self.num_features
+            self.running_var = [1.0] * self.num_features
+        else:
+            self.running_mean = None
+            self.running_var = None
+
+    def state_dict(self):
+        state = super().state_dict()
+        if self.track_running_stats:
+            state["running_mean"] = _deep_copy_nested_list(self.running_mean)
+            state["running_var"] = _deep_copy_nested_list(self.running_var)
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        super().load_state_dict(state_dict, strict=strict)
+        if self.track_running_stats:
+            if "running_mean" in state_dict:
+                self.running_mean = _deep_copy_nested_list(state_dict["running_mean"])
+            if "running_var" in state_dict:
+                self.running_var = _deep_copy_nested_list(state_dict["running_var"])
+
+    def forward(self, x):
+        if len(x.shape) != 4:
+            raise ValueError("BatchNorm2d expects 4D input of shape (batch, channels, height, width), got shape " + str(x.shape))
+
+        batch_size, channels, height, width = x.shape
+        if channels != self.num_features:
+            raise ValueError("Input channels (" + str(channels) + ") does not match BatchNorm2d num_features (" + str(self.num_features) + ")")
+
+        # Total elements per channel across batch and spatial dims
+        m = float(batch_size * height * width)
+
+        out_data = []
+        x_hat_data = []
+        inv_std_list = []
+
+        if self.training or not self.track_running_stats:
+            # 1. Compute batch mean and batch variance per channel
+            means = []
+            vars_ = []
+
+            for c in range(channels):
+                sum_val = 0.0
+                for n in range(batch_size):
+                    for h in range(height):
+                        for w in range(width):
+                            sum_val = sum_val + x.data[n][c][h][w]
+                mean_c = sum_val / m
+                means.append(mean_c)
+
+                sq_sum = 0.0
+                for n in range(batch_size):
+                    for h in range(height):
+                        for w in range(width):
+                            diff = x.data[n][c][h][w] - mean_c
+                            sq_sum = sq_sum + diff * diff
+                var_c = sq_sum / m
+                vars_.append(var_c)
+
+                # Update running statistics with exponential moving average
+                if self.training and self.track_running_stats:
+                    # Unbiased sample variance for running_var (Bessel correction)
+                    unbiased_var = (m / (m - 1.0)) * var_c if m > 1.0 else var_c
+                    self.running_mean[c] = (1.0 - self.momentum) * self.running_mean[c] + self.momentum * mean_c
+                    self.running_var[c] = (1.0 - self.momentum) * self.running_var[c] + self.momentum * unbiased_var
+
+            # 2. Compute normalized values and output
+            for n in range(batch_size):
+                n_out = []
+                n_xhat = []
+                for c in range(channels):
+                    inv_std = 1.0 / math.sqrt(vars_[c] + self.eps)
+                    if n == 0:
+                        inv_std_list.append(inv_std)
+                    gamma = self.weight.data[c] if self.affine else 1.0
+                    beta = self.bias.data[c] if self.affine else 0.0
+
+                    c_out = []
+                    c_xhat = []
+                    for h in range(height):
+                        r_out = []
+                        r_xhat = []
+                        for w in range(width):
+                            x_hat = (x.data[n][c][h][w] - means[c]) * inv_std
+                            y_val = gamma * x_hat + beta
+                            r_out.append(y_val)
+                            r_xhat.append(x_hat)
+                        c_out.append(r_out)
+                        c_xhat.append(r_xhat)
+                    n_out.append(c_out)
+                    n_xhat.append(c_xhat)
+                out_data.append(n_out)
+                x_hat_data.append(n_xhat)
+
+        else:
+            # Inference mode with running statistics (Eval mode)
+            for n in range(batch_size):
+                n_out = []
+                for c in range(channels):
+                    mean_c = self.running_mean[c]
+                    var_c = self.running_var[c]
+                    inv_std = 1.0 / math.sqrt(var_c + self.eps)
+                    gamma = self.weight.data[c] if self.affine else 1.0
+                    beta = self.bias.data[c] if self.affine else 0.0
+
+                    c_out = []
+                    for h in range(height):
+                        r_out = []
+                        for w in range(width):
+                            x_hat = (x.data[n][c][h][w] - mean_c) * inv_std
+                            y_val = gamma * x_hat + beta
+                            r_out.append(y_val)
+                        c_out.append(r_out)
+                    n_out.append(c_out)
+                out_data.append(n_out)
+
+        parents = [x]
+        req_grad = x.requires_grad
+        if self.affine:
+            parents.append(self.weight)
+            parents.append(self.bias)
+            req_grad = req_grad or self.weight.requires_grad or self.bias.requires_grad
+
+        out = Tensor(out_data, requires_grad=req_grad, _parents=tuple(parents), _op="batchnorm2d")
+
+        is_train_mode = self.training or not self.track_running_stats
+
+        def _backward():
+            # 1. Gradients with respect to gamma (weight) and beta (bias)
+            if self.affine:
+                if self.bias.requires_grad:
+                    if self.bias.grad is None:
+                        self.bias.grad = [0.0] * channels
+                    for c in range(channels):
+                        d_beta = 0.0
+                        for n in range(batch_size):
+                            for h in range(height):
+                                for w in range(width):
+                                    d_beta = d_beta + out.grad[n][c][h][w]
+                        self.bias.grad[c] = self.bias.grad[c] + d_beta
+
+                if self.weight.requires_grad:
+                    if self.weight.grad is None:
+                        self.weight.grad = [0.0] * channels
+                    for c in range(channels):
+                        d_gamma = 0.0
+                        for n in range(batch_size):
+                            for h in range(height):
+                                for w in range(width):
+                                    if is_train_mode:
+                                        x_hat_val = x_hat_data[n][c][h][w]
+                                    else:
+                                        x_hat_val = (x.data[n][c][h][w] - self.running_mean[c]) / math.sqrt(self.running_var[c] + self.eps)
+                                    d_gamma = d_gamma + out.grad[n][c][h][w] * x_hat_val
+                        self.weight.grad[c] = self.weight.grad[c] + d_gamma
+
+            # 2. Gradient with respect to input x
+            if x.requires_grad:
+                if x.grad is None:
+                    x.grad = _zeros_like_shape(x.shape)
+
+                if is_train_mode:
+                    for c in range(channels):
+                        gamma = self.weight.data[c] if self.affine else 1.0
+                        inv_std = inv_std_list[c]
+
+                        sum_dl_dxhat = 0.0
+                        sum_dl_xhat_dot = 0.0
+
+                        for n in range(batch_size):
+                            for h in range(height):
+                                for w in range(width):
+                                    dl_dxhat = out.grad[n][c][h][w] * gamma
+                                    x_hat_val = x_hat_data[n][c][h][w]
+                                    sum_dl_dxhat = sum_dl_dxhat + dl_dxhat
+                                    sum_dl_xhat_dot = sum_dl_xhat_dot + dl_dxhat * x_hat_val
+
+                        factor = inv_std / m
+                        for n in range(batch_size):
+                            for h in range(height):
+                                for w in range(width):
+                                    dl_dxhat = out.grad[n][c][h][w] * gamma
+                                    x_hat_val = x_hat_data[n][c][h][w]
+                                    dx = factor * (m * dl_dxhat - sum_dl_dxhat - x_hat_val * sum_dl_xhat_dot)
+                                    x.grad[n][c][h][w] = x.grad[n][c][h][w] + dx
+                else:
+                    # In eval mode, normalization depends solely on fixed running stats
+                    for c in range(channels):
+                        gamma = self.weight.data[c] if self.affine else 1.0
+                        inv_std = 1.0 / math.sqrt(self.running_var[c] + self.eps)
+                        for n in range(batch_size):
+                            for h in range(height):
+                                for w in range(width):
+                                    dx = out.grad[n][c][h][w] * gamma * inv_std
+                                    x.grad[n][c][h][w] = x.grad[n][c][h][w] + dx
+
+        out._backward = _backward
+        return out
+
+
 class RNNCell(Module):
     def __init__(self, input_size, hidden_size, bias=True):
         super().__init__()
