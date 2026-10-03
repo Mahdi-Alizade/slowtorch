@@ -518,6 +518,48 @@ class MultiheadAttention(Module):
         return out
 
 
+class PositionalEncoding(Module):
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.max_len = int(max_len)
+        self.dropout = Dropout(p=dropout)
+
+        # Precompute sinusoidal positional encoding table of shape (1, max_len, d_model)
+        pe_matrix = []
+        for pos in range(self.max_len):
+            row = []
+            for i in range(self.d_model):
+                denom = math.pow(10000.0, (2 * (i // 2)) / float(self.d_model))
+                val = pos / denom
+                if i % 2 == 0:
+                    row.append(math.sin(val))
+                else:
+                    row.append(math.cos(val))
+            pe_matrix.append(row)
+
+        self.pe = Tensor([pe_matrix], requires_grad=False)
+
+    def forward(self, x):
+        # x is 3D: (batch_size, seq_len, d_model)
+        if len(x.shape) != 3:
+            raise ValueError("PositionalEncoding expects 3D input of shape (batch, seq_len, d_model), got shape " + str(x.shape))
+
+        batch_size, seq_len, dim = x.shape
+        if dim != self.d_model:
+            raise ValueError("Feature dimension (" + str(dim) + ") must match PositionalEncoding d_model (" + str(self.d_model) + ")")
+        if seq_len > self.max_len:
+            raise ValueError("Sequence length (" + str(seq_len) + ") exceeds max_len (" + str(self.max_len) + ")")
+
+        # Slice PE up to seq_len and broadcast across batch: (batch_size, seq_len, d_model)
+        pe_slice = [self.pe.data[0][t] for t in range(seq_len)]
+        pe_batch = [pe_slice for _ in range(batch_size)]
+
+        pe_tensor = Tensor(pe_batch, requires_grad=False)
+        out = x + pe_tensor
+        return self.dropout(out)
+
+
 class TransformerEncoderLayer(Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
@@ -527,7 +569,6 @@ class TransformerEncoderLayer(Module):
 
         self.self_attn = MultiheadAttention(embed_dim=self.d_model, num_heads=self.nhead)
 
-        # Feed-forward network (FFN)
         self.linear1 = Linear(self.d_model, self.dim_feedforward)
         self.dropout = Dropout(p=dropout)
         self.linear2 = Linear(self.dim_feedforward, self.d_model)
@@ -539,11 +580,9 @@ class TransformerEncoderLayer(Module):
         self.dropout2 = Dropout(p=dropout)
 
     def forward(self, src, src_mask=None):
-        # 1. Self-Attention with Residual & LayerNorm
         attn_out = self.self_attn(src, src, src, attn_mask=src_mask)
         src = self.norm1(src + self.dropout1(attn_out))
 
-        # 2. Feed-Forward with Residual & LayerNorm
         ffn_out = self.linear2(self.dropout(self.linear1(src).relu()))
         src = self.norm2(src + self.dropout2(ffn_out))
 
@@ -1477,8 +1516,8 @@ class LayerNorm(Module):
                         for c in range(cols):
                             if self.elementwise_affine:
                                 dl_dxhat.append(out.grad[r][c] * self.weight.data[c])
-                            else:
-                                dl_dxhat.append(out.grad[r][c])
+                        else:
+                            dl_dxhat.append(out.grad[r][c])
 
                         sum_dl = 0.0
                         sum_dl_xhat = 0.0
