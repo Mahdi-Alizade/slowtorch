@@ -63,18 +63,22 @@ def _unflatten_to_shape(flat_list, target_shape):
         return flat_list[0]
     if len(target_shape) == 1:
         return list(flat_list)
-    if len(target_shape) == 2:
-        rows, cols = target_shape
-        out = []
-        idx = 0
-        for _ in range(rows):
+
+    def _build_recursive(iterator, shape):
+        if len(shape) == 1:
             row = []
-            for _ in range(cols):
-                row.append(flat_list[idx])
-                idx = idx + 1
-            out.append(row)
-        return out
-    raise NotImplementedError("Shapes beyond 2D unflatten not supported: " + str(target_shape))
+            for _ in range(shape[0]):
+                row.append(next(iterator))
+            return row
+        dim = shape[0]
+        sub_shape = shape[1:]
+        res = []
+        for _ in range(dim):
+            res.append(_build_recursive(iterator, sub_shape))
+        return res
+
+    it = iter(flat_list)
+    return _build_recursive(it, target_shape)
 
 
 def _matrix_transpose(mat):
@@ -236,18 +240,14 @@ class Tensor:
                 out._backward = _backward
             return out
 
-        elif len(self.shape) == 2 and len(other.shape) == 2:
-            if self.shape != other.shape:
-                raise ValueError("Shape mismatch for 2D addition: " + str(self.shape) + " vs " + str(other.shape))
-            rows = self.shape[0]
-            cols = self.shape[1]
-            new_grid = []
-            for r in range(rows):
-                new_row = []
-                for c in range(cols):
-                    new_row.append(self.data[r][c] + other.data[r][c])
-                new_grid.append(new_row)
+        elif self.shape == other.shape:
+            flat_self = _flatten_list(self.data)
+            flat_other = _flatten_list(other.data)
+            flat_res = []
+            for i in range(len(flat_self)):
+                flat_res.append(flat_self[i] + flat_other[i])
 
+            new_grid = _unflatten_to_shape(flat_res, self.shape)
             out = Tensor(new_grid, requires_grad=req_grad, _parents=(self, other), _op="+")
 
             if req_grad:
@@ -255,16 +255,20 @@ class Tensor:
                     if self.requires_grad:
                         if self.grad is None:
                             self.grad = _zeros_like_shape(self.shape)
-                        for r in range(rows):
-                            for c in range(cols):
-                                self.grad[r][c] = self.grad[r][c] + out.grad[r][c]
+                        flat_out = _flatten_list(out.grad)
+                        flat_g = _flatten_list(self.grad)
+                        for i in range(len(flat_g)):
+                            flat_g[i] = flat_g[i] + flat_out[i]
+                        self.grad = _unflatten_to_shape(flat_g, self.shape)
 
                     if other.requires_grad:
                         if other.grad is None:
                             other.grad = _zeros_like_shape(other.shape)
-                        for r in range(rows):
-                            for c in range(cols):
-                                other.grad[r][c] = other.grad[r][c] + out.grad[r][c]
+                        flat_out = _flatten_list(out.grad)
+                        flat_g = _flatten_list(other.grad)
+                        for i in range(len(flat_g)):
+                            flat_g[i] = flat_g[i] + flat_out[i]
+                        other.grad = _unflatten_to_shape(flat_g, other.shape)
 
                 out._backward = _backward
             return out
@@ -305,91 +309,67 @@ class Tensor:
                 out._backward = _backward
             return out
 
-        elif len(self.shape) == 2 and other.shape == ():
-            new_data = []
-            rows = self.shape[0]
-            cols = self.shape[1]
-            for r in range(rows):
-                row = []
-                for c in range(cols):
-                    row.append(self.data[r][c] * other.data)
-                new_data.append(row)
-
-            out = Tensor(new_data, requires_grad=req_grad, _parents=(self, other), _op="*")
+        elif other.shape == ():
+            flat_self = _flatten_list(self.data)
+            scalar_val = other.data
+            flat_res = []
+            for v in flat_self:
+                flat_res.append(v * scalar_val)
+            out_data = _unflatten_to_shape(flat_res, self.shape)
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self, other), _op="*")
 
             if req_grad:
                 def _backward():
                     if self.requires_grad:
                         if self.grad is None:
                             self.grad = _zeros_like_shape(self.shape)
-                        for r in range(rows):
-                            for c in range(cols):
-                                self.grad[r][c] = self.grad[r][c] + other.data * out.grad[r][c]
+                        flat_og = _flatten_list(out.grad)
+                        flat_g = _flatten_list(self.grad)
+                        for i in range(len(flat_g)):
+                            flat_g[i] = flat_g[i] + flat_og[i] * scalar_val
+                        self.grad = _unflatten_to_shape(flat_g, self.shape)
 
                     if other.requires_grad:
                         if other.grad is None:
                             other.grad = 0.0
-                        for r in range(rows):
-                            for c in range(cols):
-                                other.grad[r][c] = other.grad[r][c] + self.data[r][c] * out.grad[r][c]
+                        flat_og = _flatten_list(out.grad)
+                        flat_x = _flatten_list(self.data)
+                        s = 0.0
+                        for i in range(len(flat_x)):
+                            s = s + flat_x[i] * flat_og[i]
+                        other.grad = other.grad + s
 
                 out._backward = _backward
             return out
 
-        elif len(self.shape) == 1 and len(other.shape) == 1:
-            new_data = []
-            for i in range(len(self.data)):
-                mult_val = self.data[i] * other.data[i]
-                new_data.append(mult_val)
+        elif self.shape == other.shape:
+            flat_self = _flatten_list(self.data)
+            flat_other = _flatten_list(other.data)
+            flat_res = []
+            for i in range(len(flat_self)):
+                flat_res.append(flat_self[i] * flat_other[i])
 
-            out = Tensor(new_data, requires_grad=req_grad, _parents=(self, other), _op="*")
-
-            if req_grad:
-                def _backward():
-                    if self.requires_grad:
-                        if self.grad is None:
-                            self.grad = [0.0] * len(self.data)
-                        for i in range(len(self.data)):
-                            self.grad[i] = self.grad[i] + other.data[i] * out.grad[i]
-
-                    if other.requires_grad:
-                        if other.grad is None:
-                            other.grad = [0.0] * len(other.data)
-                        for j in range(len(other.data)):
-                            other.grad[j] = other.grad[j] + self.data[j] * out.grad[j]
-
-                out._backward = _backward
-            return out
-
-        elif len(self.shape) == 2 and len(other.shape) == 2:
-            if self.shape != other.shape:
-                raise ValueError("Shape mismatch for element-wise multiplication: " + str(self.shape) + " vs " + str(other.shape))
-            rows = self.shape[0]
-            cols = self.shape[1]
-            new_grid = []
-            for r in range(rows):
-                new_row = []
-                for c in range(cols):
-                    new_row.append(self.data[r][c] * other.data[r][c])
-                new_grid.append(new_row)
-
-            out = Tensor(new_grid, requires_grad=req_grad, _parents=(self, other), _op="*")
+            out_data = _unflatten_to_shape(flat_res, self.shape)
+            out = Tensor(out_data, requires_grad=req_grad, _parents=(self, other), _op="*")
 
             if req_grad:
                 def _backward():
+                    flat_og = _flatten_list(out.grad)
                     if self.requires_grad:
                         if self.grad is None:
                             self.grad = _zeros_like_shape(self.shape)
-                        for r in range(rows):
-                            for c in range(cols):
-                                self.grad[r][c] = self.grad[r][c] + other.data[r][c] * out.grad[r][c]
+                        flat_g = _flatten_list(self.grad)
+                        for i in range(len(flat_g)):
+                            flat_g[i] = flat_g[i] + flat_other[i] * flat_og[i]
+                        self.grad = _unflatten_to_shape(flat_g, self.shape)
 
                     if other.requires_grad:
                         if other.grad is None:
                             other.grad = _zeros_like_shape(other.shape)
-                        for r in range(rows):
-                            for c in range(cols):
-                                other.grad[r][c] = other.grad[r][c] + self.data[r][c] * out.grad[r][c]
+                        flat_g = _flatten_list(other.grad)
+                        for i in range(len(flat_g)):
+                            flat_g[i] = flat_g[i] + flat_self[i] * flat_og[i]
+                        other.grad = _unflatten_to_shape(flat_g, other.shape)
 
                 out._backward = _backward
             return out
@@ -536,15 +516,14 @@ class Tensor:
                     flat_out_grad = _flatten_list(out.grad) if isinstance(out.grad, list) else [out.grad]
                     restored_grad = _unflatten_to_shape(flat_out_grad, self.shape)
 
+                    flat_self_g = _flatten_list(self.grad) if isinstance(self.grad, list) else [self.grad]
+                    for i in range(len(flat_self_g)):
+                        flat_self_g[i] = flat_self_g[i] + flat_out_grad[i]
+
                     if self.shape == ():
-                        self.grad = self.grad + restored_grad
-                    elif len(self.shape) == 1:
-                        for i in range(len(self.grad)):
-                            self.grad[i] = self.grad[i] + restored_grad[i]
-                    elif len(self.shape) == 2:
-                        for r in range(len(self.grad)):
-                            for c in range(len(self.grad[0])):
-                                self.grad[r][c] = self.grad[r][c] + restored_grad[r][c]
+                        self.grad = flat_self_g[0]
+                    else:
+                        self.grad = _unflatten_to_shape(flat_self_g, self.shape)
 
             out._backward = _backward
         return out
