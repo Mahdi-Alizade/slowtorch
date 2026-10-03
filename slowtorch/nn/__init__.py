@@ -1,3 +1,4 @@
+
 from slowtorch.nn.modules import (
     Module,
     Sequential,
@@ -12,6 +13,7 @@ from slowtorch.nn.modules import (
     RNN,
     LSTMCell,
     LSTM,
+    MultiheadAttention,
     LayerNorm,
     Dropout,
     ReLU,
@@ -37,6 +39,7 @@ __all__ = [
     "RNN",
     "LSTMCell",
     "LSTM",
+    "MultiheadAttention",
     "LayerNorm",
     "Dropout",
     "ReLU",

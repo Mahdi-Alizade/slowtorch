@@ -1,3 +1,4 @@
+
 from slowtorch.tensor import Tensor, no_grad, is_grad_enabled, set_grad_enabled
 from slowtorch.nn import (
     Module,
@@ -13,6 +14,7 @@ from slowtorch.nn import (
     RNN,
     LSTMCell,
     LSTM,
+    MultiheadAttention,
     LayerNorm,
     Dropout,
     ReLU,
@@ -45,6 +47,7 @@ __all__ = [
     "RNN",
     "LSTMCell",
     "LSTM",
+    "MultiheadAttention",
     "LayerNorm",
     "Dropout",
     "ReLU",

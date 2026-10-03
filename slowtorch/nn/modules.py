@@ -1,3 +1,4 @@
+
 import math
 import random
 import json
@@ -367,9 +368,170 @@ class Linear(Module):
             self.bias = None
 
     def forward(self, x):
-        out = x @ self.weight
-        if self.bias is not None:
-            out = out + self.bias
+        # Supports 2D (batch, in) or 3D (batch, seq, in)
+        if len(x.shape) == 2:
+            out = x @ self.weight
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+        elif len(x.shape) == 3:
+            batch_size, seq_len, in_f = x.shape
+            # Flatten to 2D for matmul
+            x_2d = x.reshape(batch_size * seq_len, in_f)
+            out_2d = x_2d @ self.weight
+            if self.bias is not None:
+                out_2d = out_2d + self.bias
+            out = out_2d.reshape(batch_size, seq_len, self.out_features)
+            return out
+        else:
+            raise NotImplementedError("Linear forward currently supports 2D and 3D inputs, got shape " + str(x.shape))
+
+
+class MultiheadAttention(Module):
+    def __init__(self, embed_dim, num_heads, bias=True):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.bias = bool(bias)
+
+        if self.embed_dim % self.num_heads != 0:
+            raise ValueError("embed_dim (" + str(self.embed_dim) + ") must be divisible by num_heads (" + str(self.num_heads) + ")")
+
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+        self.q_proj = Linear(self.embed_dim, self.embed_dim, bias=self.bias)
+        self.k_proj = Linear(self.embed_dim, self.embed_dim, bias=self.bias)
+        self.v_proj = Linear(self.embed_dim, self.embed_dim, bias=self.bias)
+        self.out_proj = Linear(self.embed_dim, self.embed_dim, bias=self.bias)
+
+    def forward(self, query, key, value, attn_mask=None):
+        # Shapes: (batch_size, seq_len, embed_dim)
+        if len(query.shape) != 3 or len(key.shape) != 3 or len(value.shape) != 3:
+            raise ValueError("MultiheadAttention expects 3D inputs of shape (batch, seq_len, embed_dim)")
+
+        batch_size, tgt_len, _ = query.shape
+        _, src_len, _ = key.shape
+
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+
+        # Process attention independently per batch item and per head
+        # This keeps the autograd graph purely in 2D matmuls and standard Softmax
+        batch_head_outputs = []
+
+        for b in range(batch_size):
+            head_outputs = []
+            for h in range(self.num_heads):
+                start_idx = h * self.head_dim
+                end_idx = start_idx + self.head_dim
+
+                # Slice Q, K, V for this head: (len, head_dim)
+                q_head_data = [q.data[b][t][start_idx:end_idx] for t in range(tgt_len)]
+                k_head_data = [k.data[b][s][start_idx:end_idx] for s in range(src_len)]
+                v_head_data = [v.data[b][s][start_idx:end_idx] for s in range(src_len)]
+
+                q_h = Tensor(q_head_data, requires_grad=q.requires_grad, _parents=(q,), _op="slice_qh")
+                k_h = Tensor(k_head_data, requires_grad=k.requires_grad, _parents=(k,), _op="slice_kh")
+                v_h = Tensor(v_head_data, requires_grad=v.requires_grad, _parents=(v,), _op="slice_vh")
+
+                # Setup backward routing for Q, K, V slices
+                if q.requires_grad:
+                    def _make_back_q(target, node, b_idx, s_idx, e_idx, t_len):
+                        def _b():
+                            if target.requires_grad and node.grad is not None:
+                                if target.grad is None:
+                                    target.grad = _zeros_like_shape(target.shape)
+                                for t in range(t_len):
+                                    for idx, col in enumerate(range(s_idx, e_idx)):
+                                        target.grad[b_idx][t][col] = target.grad[b_idx][t][col] + node.grad[t][idx]
+                        return _b
+                    q_h._backward = _make_back_q(q, q_h, b, start_idx, end_idx, tgt_len)
+
+                if k.requires_grad:
+                    def _make_back_k(target, node, b_idx, s_idx, e_idx, s_len):
+                        def _b():
+                            if target.requires_grad and node.grad is not None:
+                                if target.grad is None:
+                                    target.grad = _zeros_like_shape(target.shape)
+                                for s in range(s_len):
+                                    for idx, col in enumerate(range(s_idx, e_idx)):
+                                        target.grad[b_idx][s][col] = target.grad[b_idx][s][col] + node.grad[s][idx]
+                        return _b
+                    k_h._backward = _make_back_k(k, k_h, b, start_idx, end_idx, src_len)
+
+                if v.requires_grad:
+                    def _make_back_v(target, node, b_idx, s_idx, e_idx, s_len):
+                        def _b():
+                            if target.requires_grad and node.grad is not None:
+                                if target.grad is None:
+                                    target.grad = _zeros_like_shape(target.shape)
+                                for s in range(s_len):
+                                    for idx, col in enumerate(range(s_idx, e_idx)):
+                                        target.grad[b_idx][s][col] = target.grad[b_idx][s][col] + node.grad[s][idx]
+                        return _b
+                    v_h._backward = _make_back_v(v, v_h, b, start_idx, end_idx, src_len)
+
+                # Scaled Dot-Product: scores = (Q @ K.T) * scale
+                scores = (q_h @ k_h.T) * self.scale
+
+                # Optional attention mask
+                if attn_mask is not None:
+                    # attn_mask shape: (tgt_len, src_len)
+                    mask_tensor = attn_mask if isinstance(attn_mask, Tensor) else Tensor(attn_mask)
+                    scores = scores + mask_tensor
+
+                # Softmax along sequence dimension (dim=-1)
+                # scores shape: (tgt_len, src_len)
+                probs = Softmax(dim=-1)(scores)
+
+                # Context head output: (tgt_len, head_dim)
+                head_out = probs @ v_h
+                head_outputs.append(head_out)
+
+            batch_head_outputs.append(head_outputs)
+
+        # Concatenate heads along feature dimension: (batch, tgt_len, embed_dim)
+        concat_data = []
+        for b in range(batch_size):
+            b_rows = []
+            for t in range(tgt_len):
+                row_feats = []
+                for h in range(self.num_heads):
+                    head_row = batch_head_outputs[b][h].data[t]
+                    row_feats.extend(head_row)
+                b_rows.append(row_feats)
+            concat_data.append(b_rows)
+
+        parents_all = []
+        for b in range(batch_size):
+            for h in range(self.num_heads):
+                parents_all.append(batch_head_outputs[b][h])
+
+        req_grad = any(p.requires_grad for p in parents_all)
+        concat_tensor = Tensor(concat_data, requires_grad=req_grad, _parents=tuple(parents_all), _op="concat_heads")
+
+        if req_grad:
+            def _backward_concat():
+                if concat_tensor.grad is None:
+                    return
+                for b_idx in range(batch_size):
+                    for h_idx in range(self.num_heads):
+                        node = batch_head_outputs[b_idx][h_idx]
+                        if node.requires_grad:
+                            if node.grad is None:
+                                node.grad = _zeros_like_shape(node.shape)
+                            st = h_idx * self.head_dim
+                            en = st + self.head_dim
+                            for t in range(tgt_len):
+                                for d_idx, c in enumerate(range(st, en)):
+                                    node.grad[t][d_idx] = node.grad[t][d_idx] + concat_tensor.grad[b_idx][t][c]
+
+            concat_tensor._backward = _backward_concat
+
+        # Final linear projection
+        out = self.out_proj(concat_tensor)
         return out
 
 
@@ -689,15 +851,12 @@ class BatchNorm2d(Module):
         if channels != self.num_features:
             raise ValueError("Input channels (" + str(channels) + ") does not match BatchNorm2d num_features (" + str(self.num_features) + ")")
 
-        # Total elements per channel across batch and spatial dims
         m = float(batch_size * height * width)
-
         out_data = []
         x_hat_data = []
         inv_std_list = []
 
         if self.training or not self.track_running_stats:
-            # 1. Compute batch mean and batch variance per channel
             means = []
             vars_ = []
 
@@ -719,14 +878,11 @@ class BatchNorm2d(Module):
                 var_c = sq_sum / m
                 vars_.append(var_c)
 
-                # Update running statistics with exponential moving average
                 if self.training and self.track_running_stats:
-                    # Unbiased sample variance for running_var (Bessel correction)
                     unbiased_var = (m / (m - 1.0)) * var_c if m > 1.0 else var_c
                     self.running_mean[c] = (1.0 - self.momentum) * self.running_mean[c] + self.momentum * mean_c
                     self.running_var[c] = (1.0 - self.momentum) * self.running_var[c] + self.momentum * unbiased_var
 
-            # 2. Compute normalized values and output
             for n in range(batch_size):
                 n_out = []
                 n_xhat = []
@@ -755,7 +911,6 @@ class BatchNorm2d(Module):
                 x_hat_data.append(n_xhat)
 
         else:
-            # Inference mode with running statistics (Eval mode)
             for n in range(batch_size):
                 n_out = []
                 for c in range(channels):
@@ -784,11 +939,9 @@ class BatchNorm2d(Module):
             req_grad = req_grad or self.weight.requires_grad or self.bias.requires_grad
 
         out = Tensor(out_data, requires_grad=req_grad, _parents=tuple(parents), _op="batchnorm2d")
-
         is_train_mode = self.training or not self.track_running_stats
 
         def _backward():
-            # 1. Gradients with respect to gamma (weight) and beta (bias)
             if self.affine:
                 if self.bias.requires_grad:
                     if self.bias.grad is None:
@@ -816,7 +969,6 @@ class BatchNorm2d(Module):
                                     d_gamma = d_gamma + out.grad[n][c][h][w] * x_hat_val
                         self.weight.grad[c] = self.weight.grad[c] + d_gamma
 
-            # 2. Gradient with respect to input x
             if x.requires_grad:
                 if x.grad is None:
                     x.grad = _zeros_like_shape(x.shape)
@@ -846,7 +998,6 @@ class BatchNorm2d(Module):
                                     dx = factor * (m * dl_dxhat - sum_dl_dxhat - x_hat_val * sum_dl_xhat_dot)
                                     x.grad[n][c][h][w] = x.grad[n][c][h][w] + dx
                 else:
-                    # In eval mode, normalization depends solely on fixed running stats
                     for c in range(channels):
                         gamma = self.weight.data[c] if self.affine else 1.0
                         inv_std = 1.0 / math.sqrt(self.running_var[c] + self.eps)
@@ -1230,105 +1381,112 @@ class LayerNorm(Module):
             self.bias = None
 
     def forward(self, x):
-        if len(x.shape) != 2:
-            raise NotImplementedError("LayerNorm currently only supports 2D inputs (batch_size, features)")
+        if len(x.shape) == 2:
+            rows = x.shape[0]
+            cols = x.shape[1]
+            dim = float(cols)
 
-        rows = x.shape[0]
-        cols = x.shape[1]
-        dim = float(cols)
+            if cols != self.normalized_shape[0]:
+                raise ValueError("Input feature size (" + str(cols) + ") doesn't match LayerNorm shape (" + str(self.normalized_shape[0]) + ")")
 
-        if cols != self.normalized_shape[0]:
-            raise ValueError("Input feature size (" + str(cols) + ") doesn't match LayerNorm shape (" + str(self.normalized_shape[0]) + ")")
+            normalized_grid = []
+            x_hat_grid = []
+            inv_std_list = []
 
-        normalized_grid = []
-        x_hat_grid = []
-        inv_std_list = []
+            for r in range(rows):
+                mean_val = 0.0
+                for c in range(cols):
+                    mean_val = mean_val + x.data[r][c]
+                mean_val = mean_val / dim
 
-        for r in range(rows):
-            mean_val = 0.0
-            for c in range(cols):
-                mean_val = mean_val + x.data[r][c]
-            mean_val = mean_val / dim
+                var_val = 0.0
+                for c in range(cols):
+                    diff = x.data[r][c] - mean_val
+                    var_val = var_val + diff * diff
+                var_val = var_val / dim
 
-            var_val = 0.0
-            for c in range(cols):
-                diff = x.data[r][c] - mean_val
-                var_val = var_val + diff * diff
-            var_val = var_val / dim
+                inv_std = 1.0 / math.sqrt(var_val + self.eps)
+                inv_std_list.append(inv_std)
 
-            inv_std = 1.0 / math.sqrt(var_val + self.eps)
-            inv_std_list.append(inv_std)
+                out_row = []
+                x_hat_row = []
+                for c in range(cols):
+                    x_hat = (x.data[r][c] - mean_val) * inv_std
+                    x_hat_row.append(x_hat)
 
-            out_row = []
-            x_hat_row = []
-            for c in range(cols):
-                x_hat = (x.data[r][c] - mean_val) * inv_std
-                x_hat_row.append(x_hat)
+                    val = x_hat
+                    if self.elementwise_affine:
+                        val = val * self.weight.data[c] + self.bias.data[c]
+                    out_row.append(val)
 
-                val = x_hat
-                if self.elementwise_affine:
-                    val = val * self.weight.data[c] + self.bias.data[c]
-                out_row.append(val)
+                x_hat_grid.append(x_hat_row)
+                normalized_grid.append(out_row)
 
-            x_hat_grid.append(x_hat_row)
-            normalized_grid.append(out_row)
-
-        parents = [x]
-        req_grad = x.requires_grad
-        if self.elementwise_affine:
-            parents.append(self.weight)
-            parents.append(self.bias)
-            req_grad = req_grad or self.weight.requires_grad or self.bias.requires_grad
-
-        out = Tensor(normalized_grid, requires_grad=req_grad, _parents=tuple(parents), _op="layernorm")
-
-        def _backward():
+            parents = [x]
+            req_grad = x.requires_grad
             if self.elementwise_affine:
-                if self.weight.requires_grad:
-                    if self.weight.grad is None:
-                        self.weight.grad = [0.0] * cols
-                    for c in range(cols):
-                        g_sum = 0.0
-                        for r in range(rows):
-                            g_sum = g_sum + out.grad[r][c] * x_hat_grid[r][c]
-                        self.weight.grad[c] = self.weight.grad[c] + g_sum
+                parents.append(self.weight)
+                parents.append(self.bias)
+                req_grad = req_grad or self.weight.requires_grad or self.bias.requires_grad
 
-                if self.bias.requires_grad:
-                    if self.bias.grad is None:
-                        self.bias.grad = [0.0] * cols
-                    for c in range(cols):
-                        b_sum = 0.0
-                        for r in range(rows):
-                            b_sum = b_sum + out.grad[r][c]
-                        self.bias.grad[c] = self.bias.grad[c] + b_sum
+            out = Tensor(normalized_grid, requires_grad=req_grad, _parents=tuple(parents), _op="layernorm")
 
-            if x.requires_grad:
-                if x.grad is None:
-                    x.grad = _zeros_like_shape(x.shape)
+            def _backward():
+                if self.elementwise_affine:
+                    if self.weight.requires_grad:
+                        if self.weight.grad is None:
+                            self.weight.grad = [0.0] * cols
+                        for c in range(cols):
+                            g_sum = 0.0
+                            for r in range(rows):
+                                g_sum = g_sum + out.grad[r][c] * x_hat_grid[r][c]
+                            self.weight.grad[c] = self.weight.grad[c] + g_sum
 
-                for r in range(rows):
-                    inv_std = inv_std_list[r]
+                    if self.bias.requires_grad:
+                        if self.bias.grad is None:
+                            self.bias.grad = [0.0] * cols
+                        for c in range(cols):
+                            b_sum = 0.0
+                            for r in range(rows):
+                                b_sum = b_sum + out.grad[r][c]
+                            self.bias.grad[c] = self.bias.grad[c] + b_sum
 
-                    dl_dxhat = []
-                    for c in range(cols):
-                        if self.elementwise_affine:
-                            dl_dxhat.append(out.grad[r][c] * self.weight.data[c])
-                        else:
-                            dl_dxhat.append(out.grad[r][c])
+                if x.requires_grad:
+                    if x.grad is None:
+                        x.grad = _zeros_like_shape(x.shape)
 
-                    sum_dl = 0.0
-                    sum_dl_xhat = 0.0
-                    for c in range(cols):
-                        sum_dl = sum_dl + dl_dxhat[c]
-                        sum_dl_xhat = sum_dl_xhat + dl_dxhat[c] * x_hat_grid[r][c]
+                    for r in range(rows):
+                        inv_std = inv_std_list[r]
 
-                    for c in range(cols):
-                        grad_term = dim * dl_dxhat[c] - sum_dl - x_hat_grid[r][c] * sum_dl_xhat
-                        dx = (inv_std / dim) * grad_term
-                        x.grad[r][c] = x.grad[r][c] + dx
+                        dl_dxhat = []
+                        for c in range(cols):
+                            if self.elementwise_affine:
+                                dl_dxhat.append(out.grad[r][c] * self.weight.data[c])
+                            else:
+                                dl_dxhat.append(out.grad[r][c])
 
-        out._backward = _backward
-        return out
+                        sum_dl = 0.0
+                        sum_dl_xhat = 0.0
+                        for c in range(cols):
+                            sum_dl = sum_dl + dl_dxhat[c]
+                            sum_dl_xhat = sum_dl_xhat + dl_dxhat[c] * x_hat_grid[r][c]
+
+                        for c in range(cols):
+                            grad_term = dim * dl_dxhat[c] - sum_dl - x_hat_grid[r][c] * sum_dl_xhat
+                            dx = (inv_std / dim) * grad_term
+                            x.grad[r][c] = x.grad[r][c] + dx
+
+            out._backward = _backward
+            return out
+
+        elif len(x.shape) == 3:
+            b, s, f = x.shape
+            x_2d = x.reshape(b * s, f)
+            out_2d = self.forward(x_2d)
+            return out_2d.reshape(b, s, f)
+
+        else:
+            raise NotImplementedError("LayerNorm currently supports 2D and 3D inputs, got shape " + str(x.shape))
 
 
 class Dropout(Module):
@@ -1344,56 +1502,40 @@ class Dropout(Module):
 
         scale = 1.0 / (1.0 - self.p)
 
-        if len(x.shape) == 1:
-            mask = []
-            out_data = []
-            for i in range(len(x.data)):
+        def _apply_dropout_data(data):
+            if isinstance(data, (int, float)):
                 keep = 1.0 if random.random() >= self.p else 0.0
-                mask.append(keep * scale)
-                out_data.append(x.data[i] * keep * scale)
+                return data * keep * scale, keep * scale
+            data_out = []
+            mask_out = []
+            for item in data:
+                d_res, m_res = _apply_dropout_data(item)
+                data_out.append(d_res)
+                mask_out.append(m_res)
+            return data_out, mask_out
 
-            out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,), _op="dropout")
+        out_data, mask_data = _apply_dropout_data(x.data)
+        out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,), _op="dropout")
 
-            def _backward():
-                if x.requires_grad:
-                    if x.grad is None:
-                        x.grad = [0.0] * len(x.data)
-                    for i in range(len(x.data)):
-                        x.grad[i] = x.grad[i] + out.grad[i] * mask[i]
+        def _backward():
+            if x.requires_grad:
+                if x.grad is None:
+                    x.grad = _zeros_like_shape(x.shape)
 
-            out._backward = _backward
-            return out
+                def _accum_grad(x_g, out_g, m_g):
+                    if isinstance(x_g, list):
+                        for i in range(len(x_g)):
+                            if isinstance(x_g[i], list):
+                                _accum_grad(x_g[i], out_g[i], m_g[i])
+                            else:
+                                x_g[i] = x_g[i] + out_g[i] * m_g[i]
+                    else:
+                        x.grad = x.grad + out_g * m_g
 
-        elif len(x.shape) == 2:
-            rows = x.shape[0]
-            cols = x.shape[1]
-            mask = []
-            out_data = []
+                _accum_grad(x.grad, out.grad, mask_data)
 
-            for r in range(rows):
-                mask_row = []
-                data_row = []
-                for c in range(cols):
-                    keep = 1.0 if random.random() >= self.p else 0.0
-                    mask_row.append(keep * scale)
-                    data_row.append(x.data[r][c] * keep * scale)
-                mask.append(mask_row)
-                out_data.append(data_row)
-
-            out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,), _op="dropout")
-
-            def _backward():
-                if x.requires_grad:
-                    if x.grad is None:
-                        x.grad = _zeros_like_shape(x.shape)
-                    for r in range(rows):
-                        for c in range(cols):
-                            x.grad[r][c] = x.grad[r][c] + out.grad[r][c] * mask[r][c]
-
-            out._backward = _backward
-            return out
-        else:
-            raise NotImplementedError("Dropout currently only supports 1D and 2D tensors, got shape " + str(x.shape))
+        out._backward = _backward
+        return out
 
 
 class ReLU(Module):
