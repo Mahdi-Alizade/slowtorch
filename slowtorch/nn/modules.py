@@ -1,4 +1,3 @@
-
 import math
 import random
 import json
@@ -368,7 +367,6 @@ class Linear(Module):
             self.bias = None
 
     def forward(self, x):
-        # Supports 2D (batch, in) or 3D (batch, seq, in)
         if len(x.shape) == 2:
             out = x @ self.weight
             if self.bias is not None:
@@ -376,7 +374,6 @@ class Linear(Module):
             return out
         elif len(x.shape) == 3:
             batch_size, seq_len, in_f = x.shape
-            # Flatten to 2D for matmul
             x_2d = x.reshape(batch_size * seq_len, in_f)
             out_2d = x_2d @ self.weight
             if self.bias is not None:
@@ -406,7 +403,6 @@ class MultiheadAttention(Module):
         self.out_proj = Linear(self.embed_dim, self.embed_dim, bias=self.bias)
 
     def forward(self, query, key, value, attn_mask=None):
-        # Shapes: (batch_size, seq_len, embed_dim)
         if len(query.shape) != 3 or len(key.shape) != 3 or len(value.shape) != 3:
             raise ValueError("MultiheadAttention expects 3D inputs of shape (batch, seq_len, embed_dim)")
 
@@ -417,8 +413,6 @@ class MultiheadAttention(Module):
         k = self.k_proj(key)
         v = self.v_proj(value)
 
-        # Process attention independently per batch item and per head
-        # This keeps the autograd graph purely in 2D matmuls and standard Softmax
         batch_head_outputs = []
 
         for b in range(batch_size):
@@ -427,7 +421,6 @@ class MultiheadAttention(Module):
                 start_idx = h * self.head_dim
                 end_idx = start_idx + self.head_dim
 
-                # Slice Q, K, V for this head: (len, head_dim)
                 q_head_data = [q.data[b][t][start_idx:end_idx] for t in range(tgt_len)]
                 k_head_data = [k.data[b][s][start_idx:end_idx] for s in range(src_len)]
                 v_head_data = [v.data[b][s][start_idx:end_idx] for s in range(src_len)]
@@ -436,7 +429,6 @@ class MultiheadAttention(Module):
                 k_h = Tensor(k_head_data, requires_grad=k.requires_grad, _parents=(k,), _op="slice_kh")
                 v_h = Tensor(v_head_data, requires_grad=v.requires_grad, _parents=(v,), _op="slice_vh")
 
-                # Setup backward routing for Q, K, V slices
                 if q.requires_grad:
                     def _make_back_q(target, node, b_idx, s_idx, e_idx, t_len):
                         def _b():
@@ -473,26 +465,18 @@ class MultiheadAttention(Module):
                         return _b
                     v_h._backward = _make_back_v(v, v_h, b, start_idx, end_idx, src_len)
 
-                # Scaled Dot-Product: scores = (Q @ K.T) * scale
                 scores = (q_h @ k_h.T) * self.scale
 
-                # Optional attention mask
                 if attn_mask is not None:
-                    # attn_mask shape: (tgt_len, src_len)
                     mask_tensor = attn_mask if isinstance(attn_mask, Tensor) else Tensor(attn_mask)
                     scores = scores + mask_tensor
 
-                # Softmax along sequence dimension (dim=-1)
-                # scores shape: (tgt_len, src_len)
                 probs = Softmax(dim=-1)(scores)
-
-                # Context head output: (tgt_len, head_dim)
                 head_out = probs @ v_h
                 head_outputs.append(head_out)
 
             batch_head_outputs.append(head_outputs)
 
-        # Concatenate heads along feature dimension: (batch, tgt_len, embed_dim)
         concat_data = []
         for b in range(batch_size):
             b_rows = []
@@ -530,9 +514,40 @@ class MultiheadAttention(Module):
 
             concat_tensor._backward = _backward_concat
 
-        # Final linear projection
         out = self.out_proj(concat_tensor)
         return out
+
+
+class TransformerEncoderLayer(Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.dim_feedforward = int(dim_feedforward)
+
+        self.self_attn = MultiheadAttention(embed_dim=self.d_model, num_heads=self.nhead)
+
+        # Feed-forward network (FFN)
+        self.linear1 = Linear(self.d_model, self.dim_feedforward)
+        self.dropout = Dropout(p=dropout)
+        self.linear2 = Linear(self.dim_feedforward, self.d_model)
+
+        self.norm1 = LayerNorm(self.d_model)
+        self.norm2 = LayerNorm(self.d_model)
+
+        self.dropout1 = Dropout(p=dropout)
+        self.dropout2 = Dropout(p=dropout)
+
+    def forward(self, src, src_mask=None):
+        # 1. Self-Attention with Residual & LayerNorm
+        attn_out = self.self_attn(src, src, src, attn_mask=src_mask)
+        src = self.norm1(src + self.dropout1(attn_out))
+
+        # 2. Feed-Forward with Residual & LayerNorm
+        ffn_out = self.linear2(self.dropout(self.linear1(src).relu()))
+        src = self.norm2(src + self.dropout2(ffn_out))
+
+        return src
 
 
 class Conv2d(Module):
