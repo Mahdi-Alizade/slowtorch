@@ -247,7 +247,6 @@ class Embedding(Module):
         self.embedding_dim = int(embedding_dim)
         self.padding_idx = padding_idx if padding_idx is None else int(padding_idx)
 
-        # Standard Gaussian/Uniform initialization (N(0, 1) style)
         weight_data = []
         for row_idx in range(self.num_embeddings):
             if self.padding_idx is not None and row_idx == self.padding_idx:
@@ -262,7 +261,6 @@ class Embedding(Module):
         self.weight = Parameter(weight_data)
 
     def forward(self, indices):
-        # indices can be a Tensor or a list of ints / nested list of ints
         if isinstance(indices, Tensor):
             idx_data = indices.data
             idx_shape = indices.shape
@@ -275,7 +273,6 @@ class Embedding(Module):
 
         dim = self.embedding_dim
 
-        # 1D index input: shape (L,) -> output (L, D)
         if len(idx_shape) == 1:
             seq_len = idx_shape[0]
             lookup_out = []
@@ -304,7 +301,6 @@ class Embedding(Module):
             out._backward = _backward
             return out
 
-        # 2D batch of indices: shape (B, L) -> output (B, L, D)
         elif len(idx_shape) == 2:
             batch_size = idx_shape[0]
             seq_len = idx_shape[1]
@@ -738,20 +734,20 @@ class RNN(Module):
                 t_idx = t
                 bf = self.batch_first
 
-                def _make_backward_slice(t_curr, b_flag, x_node):
+                def _make_backward_slice(t_curr, b_flag, x_node, step_tensor):
                     def _backward():
-                        if x_node.requires_grad:
+                        if x_node.requires_grad and step_tensor.grad is not None:
                             if x_node.grad is None:
                                 x_node.grad = _zeros_like_shape(x_node.shape)
                             for b in range(batch_size):
                                 for feat in range(in_size):
                                     if b_flag:
-                                        x_node.grad[b][t_curr][feat] = x_node.grad[b][t_curr][feat] + x_t.grad[b][feat]
+                                        x_node.grad[b][t_curr][feat] = x_node.grad[b][t_curr][feat] + step_tensor.grad[b][feat]
                                     else:
-                                        x_node.grad[t_curr][b][feat] = x_node.grad[t_curr][b][feat] + x_t.grad[b][feat]
+                                        x_node.grad[t_curr][b][feat] = x_node.grad[t_curr][b][feat] + step_tensor.grad[b][feat]
                     return _backward
 
-                x_t._backward = _make_backward_slice(t_idx, bf, x)
+                x_t._backward = _make_backward_slice(t_idx, bf, x, x_t)
 
             h_t = self.cell(x_t, h_t)
             h_seq.append(h_t)
@@ -776,7 +772,7 @@ class RNN(Module):
             def _backward():
                 for t in range(seq_len):
                     h_step = h_seq[t]
-                    if h_step.requires_grad:
+                    if h_step.requires_grad and output.grad is not None:
                         if h_step.grad is None:
                             h_step.grad = _zeros_like_shape(h_step.shape)
                         for b in range(batch_size):
@@ -939,20 +935,20 @@ class LSTM(Module):
                 t_idx = t
                 bf = self.batch_first
 
-                def _make_backward_slice(t_curr, b_flag, x_node):
+                def _make_backward_slice(t_curr, b_flag, x_node, step_tensor):
                     def _backward():
-                        if x_node.requires_grad:
+                        if x_node.requires_grad and step_tensor.grad is not None:
                             if x_node.grad is None:
                                 x_node.grad = _zeros_like_shape(x_node.shape)
                             for b in range(batch_size):
                                 for feat in range(in_size):
                                     if b_flag:
-                                        x_node.grad[b][t_curr][feat] = x_node.grad[b][t_curr][feat] + x_t.grad[b][feat]
+                                        x_node.grad[b][t_curr][feat] = x_node.grad[b][t_curr][feat] + step_tensor.grad[b][feat]
                                     else:
-                                        x_node.grad[t_curr][b][feat] = x_node.grad[t_curr][b][feat] + x_t.grad[b][feat]
+                                        x_node.grad[t_curr][b][feat] = x_node.grad[t_curr][b][feat] + step_tensor.grad[b][feat]
                     return _backward
 
-                x_t._backward = _make_backward_slice(t_idx, bf, x)
+                x_t._backward = _make_backward_slice(t_idx, bf, x, x_t)
 
             curr_states = (h_t, c_t) if (h_t is not None and c_t is not None) else None
             h_t, c_t = self.cell(x_t, curr_states)
@@ -978,7 +974,7 @@ class LSTM(Module):
             def _backward():
                 for t in range(seq_len):
                     h_step = h_seq[t]
-                    if h_step.requires_grad:
+                    if h_step.requires_grad and output.grad is not None:
                         if h_step.grad is None:
                             h_step.grad = _zeros_like_shape(h_step.shape)
                         for b in range(batch_size):
