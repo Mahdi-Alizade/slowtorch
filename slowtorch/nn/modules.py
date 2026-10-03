@@ -525,7 +525,6 @@ class PositionalEncoding(Module):
         self.max_len = int(max_len)
         self.dropout = Dropout(p=dropout)
 
-        # Precompute sinusoidal positional encoding table of shape (1, max_len, d_model)
         pe_matrix = []
         for pos in range(self.max_len):
             row = []
@@ -541,7 +540,6 @@ class PositionalEncoding(Module):
         self.pe = Tensor([pe_matrix], requires_grad=False)
 
     def forward(self, x):
-        # x is 3D: (batch_size, seq_len, d_model)
         if len(x.shape) != 3:
             raise ValueError("PositionalEncoding expects 3D input of shape (batch, seq_len, d_model), got shape " + str(x.shape))
 
@@ -551,7 +549,6 @@ class PositionalEncoding(Module):
         if seq_len > self.max_len:
             raise ValueError("Sequence length (" + str(seq_len) + ") exceeds max_len (" + str(self.max_len) + ")")
 
-        # Slice PE up to seq_len and broadcast across batch: (batch_size, seq_len, d_model)
         pe_slice = [self.pe.data[0][t] for t in range(seq_len)]
         pe_batch = [pe_slice for _ in range(batch_size)]
 
@@ -587,6 +584,40 @@ class TransformerEncoderLayer(Module):
         src = self.norm2(src + self.dropout2(ffn_out))
 
         return src
+
+
+class TransformerEncoder(Module):
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super().__init__()
+        self.num_layers = int(num_layers)
+        self.norm = norm
+        self._layers = []
+
+        for idx in range(self.num_layers):
+            layer_copy = TransformerEncoderLayer(
+                d_model=encoder_layer.d_model,
+                nhead=encoder_layer.nhead,
+                dim_feedforward=encoder_layer.dim_feedforward,
+                dropout=encoder_layer.dropout1.p
+            )
+            setattr(self, "layer_" + str(idx), layer_copy)
+            self._layers.append(layer_copy)
+
+    def __getitem__(self, idx):
+        return self._layers[idx]
+
+    def __len__(self):
+        return len(self._layers)
+
+    def forward(self, src, mask=None):
+        output = src
+        for layer in self._layers:
+            output = layer(output, src_mask=mask)
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output
 
 
 class Conv2d(Module):
@@ -1516,8 +1547,8 @@ class LayerNorm(Module):
                         for c in range(cols):
                             if self.elementwise_affine:
                                 dl_dxhat.append(out.grad[r][c] * self.weight.data[c])
-                        else:
-                            dl_dxhat.append(out.grad[r][c])
+                            else:
+                                dl_dxhat.append(out.grad[r][c])
 
                         sum_dl = 0.0
                         sum_dl_xhat = 0.0
