@@ -240,6 +240,109 @@ class Flatten(Module):
         return out
 
 
+class Embedding(Module):
+    def __init__(self, num_embeddings, embedding_dim, padding_idx=None):
+        super().__init__()
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        self.padding_idx = padding_idx if padding_idx is None else int(padding_idx)
+
+        # Standard Gaussian/Uniform initialization (N(0, 1) style)
+        weight_data = []
+        for row_idx in range(self.num_embeddings):
+            if self.padding_idx is not None and row_idx == self.padding_idx:
+                row = [0.0] * self.embedding_dim
+            else:
+                row = []
+                for _ in range(self.embedding_dim):
+                    val = random.gauss(0.0, 1.0)
+                    row.append(val)
+            weight_data.append(row)
+
+        self.weight = Parameter(weight_data)
+
+    def forward(self, indices):
+        # indices can be a Tensor or a list of ints / nested list of ints
+        if isinstance(indices, Tensor):
+            idx_data = indices.data
+            idx_shape = indices.shape
+        elif isinstance(indices, list):
+            idx_data = indices
+            temp = Tensor(indices)
+            idx_shape = temp.shape
+        else:
+            raise TypeError("Embedding indices must be a Tensor or list of integers, got " + str(type(indices)))
+
+        dim = self.embedding_dim
+
+        # 1D index input: shape (L,) -> output (L, D)
+        if len(idx_shape) == 1:
+            seq_len = idx_shape[0]
+            lookup_out = []
+            for i in range(seq_len):
+                w_idx = int(idx_data[i])
+                if not (0 <= w_idx < self.num_embeddings):
+                    raise IndexError("Index " + str(w_idx) + " out of range for Embedding of size " + str(self.num_embeddings))
+                row_copy = []
+                for d in range(dim):
+                    row_copy.append(self.weight.data[w_idx][d])
+                lookup_out.append(row_copy)
+
+            out = Tensor(lookup_out, requires_grad=self.weight.requires_grad, _parents=(self.weight,), _op="embedding")
+
+            def _backward():
+                if self.weight.requires_grad:
+                    if self.weight.grad is None:
+                        self.weight.grad = _zeros_like_shape(self.weight.shape)
+                    for i in range(seq_len):
+                        w_idx = int(idx_data[i])
+                        if self.padding_idx is not None and w_idx == self.padding_idx:
+                            continue
+                        for d in range(dim):
+                            self.weight.grad[w_idx][d] = self.weight.grad[w_idx][d] + out.grad[i][d]
+
+            out._backward = _backward
+            return out
+
+        # 2D batch of indices: shape (B, L) -> output (B, L, D)
+        elif len(idx_shape) == 2:
+            batch_size = idx_shape[0]
+            seq_len = idx_shape[1]
+            lookup_out = []
+
+            for b in range(batch_size):
+                b_plane = []
+                for l in range(seq_len):
+                    w_idx = int(idx_data[b][l])
+                    if not (0 <= w_idx < self.num_embeddings):
+                        raise IndexError("Index " + str(w_idx) + " out of range for Embedding of size " + str(self.num_embeddings))
+                    row_copy = []
+                    for d in range(dim):
+                        row_copy.append(self.weight.data[w_idx][d])
+                    b_plane.append(row_copy)
+                lookup_out.append(b_plane)
+
+            out = Tensor(lookup_out, requires_grad=self.weight.requires_grad, _parents=(self.weight,), _op="embedding")
+
+            def _backward():
+                if self.weight.requires_grad:
+                    if self.weight.grad is None:
+                        self.weight.grad = _zeros_like_shape(self.weight.shape)
+                    for b in range(batch_size):
+                        for l in range(seq_len):
+                            w_idx = int(idx_data[b][l])
+                            if self.padding_idx is not None and w_idx == self.padding_idx:
+                                continue
+                            for d in range(dim):
+                                self.weight.grad[w_idx][d] = self.weight.grad[w_idx][d] + out.grad[b][l][d]
+
+            out._backward = _backward
+            return out
+
+        else:
+            raise NotImplementedError("Embedding currently supports 1D and 2D index tensors, got shape " + str(idx_shape))
+
+
 class Linear(Module):
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
@@ -697,8 +800,6 @@ class LSTMCell(Module):
 
         bound = 1.0 / math.sqrt(hidden_size)
 
-        # 4 gates: input gate (i), forget gate (f), cell gate (g), output gate (o)
-        # Dimensions: (input_size, 4 * hidden_size) and (hidden_size, 4 * hidden_size)
         w_ih_data = []
         for _ in range(input_size):
             row = []
@@ -725,7 +826,6 @@ class LSTMCell(Module):
             self.bias_hh = None
 
     def forward(self, x, states=None):
-        # x is (batch_size, input_size)
         batch_size = x.shape[0]
         h_dim = self.hidden_size
 
@@ -737,8 +837,6 @@ class LSTMCell(Module):
         else:
             h, c = states
 
-        # gates_linear = x @ weight_ih + h @ weight_hh + bias_ih + bias_hh
-        # shape: (batch_size, 4 * hidden_size)
         gates = x @ self.weight_ih
         if self.bias_ih is not None:
             gates = gates + self.bias_ih
@@ -749,8 +847,6 @@ class LSTMCell(Module):
 
         gates = gates + h_proj
 
-        # Split 4 gates for each sample: i, f, g, o
-        # We perform gate slice and activations via sub-tensors
         i_data = []
         f_data = []
         g_data = []
@@ -763,7 +859,6 @@ class LSTMCell(Module):
             g_data.append(row[2 * h_dim : 3 * h_dim])
             o_data.append(row[3 * h_dim : 4 * h_dim])
 
-        # Slice nodes linked in dynamic DAG
         req_grad = gates.requires_grad
         i_gate_pre = Tensor(i_data, requires_grad=req_grad, _parents=(gates,), _op="slice_i")
         f_gate_pre = Tensor(f_data, requires_grad=req_grad, _parents=(gates,), _op="slice_f")
@@ -791,16 +886,12 @@ class LSTMCell(Module):
             g_gate_pre._backward = _backward_gates_slice
             o_gate_pre._backward = _backward_gates_slice
 
-        # Compute Gate Activations
         i_gate = i_gate_pre.sigmoid()
         f_gate = f_gate_pre.sigmoid()
         g_gate = g_gate_pre.tanh()
         o_gate = o_gate_pre.sigmoid()
 
-        # Update Cell State: c_next = f * c + i * g
         c_next = (f_gate * c) + (i_gate * g_gate)
-
-        # Update Hidden State: h_next = o * tanh(c_next)
         h_next = o_gate * c_next.tanh()
 
         return h_next, c_next
@@ -899,7 +990,6 @@ class LSTM(Module):
 
             output._backward = _backward
 
-        # Returns (output, (h_n, c_n))
         return output, (h_t, c_t)
 
 
